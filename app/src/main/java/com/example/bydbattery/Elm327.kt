@@ -56,7 +56,7 @@ class Elm327(private val socket: BluetoothSocket) {
 /** Результат разбора ответа на запрос UDS 0x22 (Read Data By Identifier). */
 sealed class UdsResult {
     class Ok(val data: IntArray, val rawHex: String) : UdsResult()
-    class Error(val message: String) : UdsResult()
+    class Error(val message: String, val nrc: Int? = null) : UdsResult()
 }
 
 object Uds {
@@ -69,6 +69,8 @@ object Uds {
     fun parse(raw: String, did: String): UdsResult {
         val lines = raw.split('\n').map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("SEARCHING", true) && !it.equals("OK", true) }
+            // "7F 22 78" = ЭБУ просит подождать, настоящий ответ идёт следующей строкой
+            .filter { it.replace(" ", "").uppercase() != "7F2278" }
         if (lines.isEmpty()) return UdsResult.Error("пустой ответ")
 
         val multiFrame = lines.any { it.contains(':') }
@@ -92,8 +94,9 @@ object Uds {
         val pretty = bytes.joinToString(" ") { "%02X".format(it) }
 
         if (bytes[0] == 0x7F) {
-            val nrc = bytes.getOrNull(2)?.let { "%02X".format(it) } ?: "??"
-            return UdsResult.Error("отказ ЭБУ, NRC=$nrc ($pretty)")
+            val nrc = bytes.getOrNull(2)
+            val nrcHex = nrc?.let { "%02X".format(it) } ?: "??"
+            return UdsResult.Error("отказ ЭБУ, NRC=$nrcHex ($pretty)", nrc)
         }
         val didHi = did.substring(0, 2).toInt(16)
         val didLo = did.substring(2, 4).toInt(16)
