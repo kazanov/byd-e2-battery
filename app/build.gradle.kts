@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.bydbattery"
         minSdk = 23
         targetSdk = 34
-        versionCode = 3
-        versionName = "3.0"
+        versionCode = 5
+        versionName = "4.1"
     }
 
     buildTypes {

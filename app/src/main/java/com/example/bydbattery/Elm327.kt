@@ -39,7 +39,6 @@ class Elm327(private val socket: BluetoothSocket) {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .toMutableList()
-        // убираем эхо команды, если ATE0 ещё не применился
         if (lines.isNotEmpty() && lines[0].replace(" ", "").equals(cmd.replace(" ", ""), true)) {
             lines.removeAt(0)
         }
@@ -53,7 +52,7 @@ class Elm327(private val socket: BluetoothSocket) {
     }
 }
 
-/** Результат разбора ответа на запрос UDS 0x22 (Read Data By Identifier). */
+/** Результат разбора ответа UDS. */
 sealed class UdsResult {
     class Ok(val data: IntArray, val rawHex: String) : UdsResult()
     class Error(val message: String, val nrc: Int? = null) : UdsResult()
@@ -62,16 +61,13 @@ sealed class UdsResult {
 object Uds {
     private val HEX = Regex("^[0-9A-Fa-f]+$")
 
-    /**
-     * Разбирает ответ ELM327 (ATH0, ATCAF1) на запрос "22 <did>".
-     * Поддерживает однокадровые ответы и многокадровый формат "0: ... 1: ...".
-     */
-    fun parse(raw: String, did: String): UdsResult {
+    /** Байты ответа при ATH0/ATCAF1 (однокадровый или "0: … 1: …"), либо текст ошибки адаптера. */
+    private fun bytesOf(raw: String): Pair<List<Int>?, String> {
         val lines = raw.split('\n').map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("SEARCHING", true) && !it.equals("OK", true) }
-            // "7F 22 78" = ЭБУ просит подождать, настоящий ответ идёт следующей строкой
-            .filter { it.replace(" ", "").uppercase() != "7F2278" }
-        if (lines.isEmpty()) return UdsResult.Error("пустой ответ")
+            // "7F xx 78" = ЭБУ просит подождать, настоящий ответ идёт следующей строкой
+            .filter { val h = it.replace(" ", "").uppercase(); !(h.length == 6 && h.startsWith("7F") && h.endsWith("78")) }
+        if (lines.isEmpty()) return null to "пустой ответ"
 
         val multiFrame = lines.any { it.contains(':') }
         val hex = StringBuilder()
@@ -81,28 +77,84 @@ object Uds {
             if (colon in 1..2) {
                 s = s.substring(colon + 1)
             } else if (multiFrame && s.length <= 3) {
-                continue // строка с длиной сообщения, например "00A"
+                continue
             }
-            if (!HEX.matches(s) || s.length % 2 != 0) {
-                return UdsResult.Error(lines.joinToString(" "))
-            }
+            if (!HEX.matches(s) || s.length % 2 != 0) return null to lines.joinToString(" ")
             hex.append(s)
         }
-
         val bytes = hex.chunked(2).map { it.toInt(16) }
-        if (bytes.isEmpty()) return UdsResult.Error("нет данных")
-        val pretty = bytes.joinToString(" ") { "%02X".format(it) }
+        return if (bytes.isEmpty()) null to "нет данных" else bytes to ""
+    }
 
-        if (bytes[0] == 0x7F) {
-            val nrc = bytes.getOrNull(2)
-            val nrcHex = nrc?.let { "%02X".format(it) } ?: "??"
-            return UdsResult.Error("отказ ЭБУ, NRC=$nrcHex ($pretty)", nrc)
+    private fun pretty(bytes: List<Int>) = bytes.joinToString(" ") { "%02X".format(it) }
+
+    private fun negative(bytes: List<Int>): UdsResult.Error {
+        val nrc = bytes.getOrNull(2)
+        val nrcHex = nrc?.let { "%02X".format(it) } ?: "??"
+        return UdsResult.Error("отказ блока: ${nrcText(nrc)} (NRC $nrcHex)", nrc)
+    }
+
+    fun nrcText(nrc: Int?): String = when (nrc) {
+        0x10 -> "общий отказ"
+        0x11 -> "сервис не поддерживается"
+        0x12 -> "подфункция не поддерживается"
+        0x13 -> "неверная длина запроса"
+        0x22 -> "условия не выполнены"
+        0x31 -> "нет такого параметра"
+        0x33 -> "доступ защищён"
+        0x7E, 0x7F -> "недоступно в текущей сессии"
+        else -> "код отказа"
+    }
+
+    /** Разбор ответа на "22 <did>". */
+    fun parse(raw: String, did: String): UdsResult {
+        val (bytes, err) = bytesOf(raw)
+        if (bytes == null) return UdsResult.Error(err)
+        if (bytes[0] == 0x7F) return negative(bytes)
+        val hi = did.substring(0, 2).toInt(16)
+        val lo = did.substring(2, 4).toInt(16)
+        if (bytes.size < 3 || bytes[0] != 0x62 || bytes[1] != hi || bytes[2] != lo) {
+            return UdsResult.Error("неожиданный ответ: ${pretty(bytes)}")
         }
-        val didHi = did.substring(0, 2).toInt(16)
-        val didLo = did.substring(2, 4).toInt(16)
-        if (bytes.size < 3 || bytes[0] != 0x62 || bytes[1] != didHi || bytes[2] != didLo) {
-            return UdsResult.Error("неожиданный ответ: $pretty")
+        return UdsResult.Ok(bytes.drop(3).toIntArray(), pretty(bytes))
+    }
+
+    /** Разбор ответа на произвольный сервис: возвращает данные после байта (sid + 0x40). */
+    fun parseService(raw: String, sid: Int): UdsResult {
+        val (bytes, err) = bytesOf(raw)
+        if (bytes == null) return UdsResult.Error(err)
+        if (bytes[0] == 0x7F) return negative(bytes)
+        if (bytes[0] != sid + 0x40) return UdsResult.Error("неожиданный ответ: ${pretty(bytes)}")
+        return UdsResult.Ok(bytes.drop(1).toIntArray(), pretty(bytes))
+    }
+}
+
+/** Сборка ISO-TP сообщений из строк ELM327 при включённых заголовках (ATH1). */
+object CanFrames {
+    fun assemble(raw: String): Map<Int, IntArray> {
+        val buf = LinkedHashMap<Int, MutableList<Int>>()
+        val len = HashMap<Int, Int>()
+        for (line in raw.split('\n')) {
+            val t = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (t.size < 2 || t[0].length != 3) continue
+            val id = t[0].toIntOrNull(16) ?: continue
+            val bytes = t.drop(1).mapNotNull { if (it.length == 2) it.toIntOrNull(16) else null }
+            if (bytes.size != t.size - 1 || bytes.isEmpty()) continue
+            val pci = bytes[0]
+            when (pci shr 4) {
+                0 -> {
+                    val n = pci and 0xF
+                    buf[id] = bytes.drop(1).take(n).toMutableList()
+                    len[id] = n
+                }
+                1 -> {
+                    if (bytes.size < 2) continue
+                    len[id] = ((pci and 0xF) shl 8) or bytes[1]
+                    buf[id] = bytes.drop(2).toMutableList()
+                }
+                2 -> buf[id]?.addAll(bytes.drop(1))
+            }
         }
-        return UdsResult.Ok(bytes.drop(3).toIntArray(), pretty)
+        return buf.mapValues { (id, l) -> l.take(len[id] ?: l.size).toIntArray() }
     }
 }

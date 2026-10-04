@@ -36,7 +36,8 @@ class ScanFileProvider : ContentProvider() {
         return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
     }
 
-    override fun getType(uri: Uri): String = "text/plain"
+    override fun getType(uri: Uri): String =
+        if (uri.lastPathSegment?.endsWith(".csv") == true) "text/csv" else "text/plain"
 
     override fun query(
         uri: Uri, projection: Array<out String>?, selection: String?,

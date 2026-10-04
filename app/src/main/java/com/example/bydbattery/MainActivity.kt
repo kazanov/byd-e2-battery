@@ -9,9 +9,10 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Typeface
+import android.content.res.ColorStateList
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -20,15 +21,20 @@ import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowManager
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -46,73 +52,379 @@ class MainActivity : Activity() {
     companion object {
         private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val REQ_BT = 1
-        private const val MAX_LOG_LINES = 400
+        private const val MAX_LOG_LINES = 300
         private const val CELL_NOMINAL_V = 3.2 // LFP
     }
 
+    private lateinit var kit: UiKit
     private val ui = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadScheduledExecutor()
     private var pollTask: ScheduledFuture<*>? = null
 
+    // --- Состояние соединения (поток worker)
     @Volatile private var elm: Elm327? = null
+    @Volatile private var selectedEcu: Ecu? = null
+    @Volatile private var craSupported = true
+
+    // --- Настройки
     @Volatile private var header = "7E7"
     @Volatile private var cellCount = 90
     @Volatile private var verbose = false
-    @Volatile private var scanning = false
-    @Volatile private var scanStop = false
+    @Volatile private var showRaw = false
+
+    // --- Длинные операции
+    @Volatile private var busy = false
+    @Volatile private var cancel = false
     private var lastScanFile: File? = null
 
+    // --- Данные
     private val values = HashMap<String, Double?>()
-
-    // Счётчики энергии (интегрирование мощности между опросами)
-    @Volatile private var energyIn = 0.0   // кВт·ч, получено батареей
-    @Volatile private var energyOut = 0.0  // кВт·ч, отдано батареей
+    @Volatile private var energyIn = 0.0
+    @Volatile private var energyOut = 0.0
     private var lastPollMs = 0L
+    private var ecus = mutableListOf<Ecu>()
+    private lateinit var recorder: Recorder
 
-    private lateinit var statusView: TextView
-    private lateinit var headerInput: EditText
-    private lateinit var cellsInput: EditText
+    // --- Views
+    private lateinit var connView: TextView
+    private lateinit var taskView: TextView
     private lateinit var connectBtn: Button
-    private lateinit var pollBtn: Button
-    private lateinit var scanBtn: Button
+    private lateinit var stopBtn: Button
+    private val tabs = mutableListOf<Pair<TextView, View>>()
+    private val tiles = HashMap<String, Tile>()
+    private lateinit var socBig: TextView
+    private lateinit var socSub: TextView
+    private lateinit var socBar: ProgressBar
+    private lateinit var moduleView: TextView
+    private lateinit var cellView: TextView
+    private lateinit var dtcSpinner: Spinner
+    private lateinit var dtcList: LinearLayout
+    private lateinit var ecuList: LinearLayout
+    private lateinit var obdView: TextView
+    private lateinit var termSpinner: Spinner
     private lateinit var termInput: EditText
     private lateinit var logView: TextView
-    private lateinit var logScroll: ScrollView
-    private lateinit var moduleView: TextView
-    private val valueViews = HashMap<String, TextView>()
-    private val rawViews = HashMap<String, TextView>()
+    private lateinit var recStatus: TextView
+    private lateinit var recBtn: Button
+    private lateinit var recBadge: TextView
+    private lateinit var filesList: LinearLayout
     private val logLines = ArrayDeque<String>()
 
-    // ---------------------------------------------------------------- UI
+    private fun bms(): Ecu {
+        val req = header.toIntOrNull(16) ?: 0x7E7
+        return Ecu(req, req + 8, "BMS (батарея)")
+    }
+
+    /** Список блоков для выбора: BMS + найденные. */
+    private fun targets(): List<Ecu> = listOf(bms()) + ecus.filter { it.req != bms().req }
+
+    // =================================================================== UI
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        kit = UiKit(this)
+        val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        header = prefs.getString("header", "7E7") ?: "7E7"
+        cellCount = prefs.getInt("cells", 90)
+        showRaw = prefs.getBoolean("raw", false)
+        ecus = EcuStore.load(this)
+        recorder = Recorder(ScanFileProvider.dir(this))
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.statusBarColor = Palette.BG
+        window.navigationBarColor = Palette.TAB_BG
         setContentView(buildUi())
-        setStatus("Не подключено")
+        selectTab(0)
+        refreshTargets()
+        renderEcus()
+        renderEnergy()
+        setConn(false, "Не подключено")
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
-    private fun section(root: LinearLayout, title: String) {
-        root.addView(TextView(this).apply {
-            text = title
-            textSize = 18f
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, dp(22), 0, dp(2))
-        })
+    private fun savePrefs() {
+        getSharedPreferences("settings", Context.MODE_PRIVATE).edit()
+            .putString("header", header).putInt("cells", cellCount).putBoolean("raw", showRaw).apply()
     }
 
-    private fun valueRow(root: LinearLayout, key: String, title: String, withRaw: Boolean) {
-        root.addView(TextView(this).apply { text = title; textSize = 13f; setPadding(0, dp(10), 0, 0) })
-        val value = TextView(this).apply { text = "—"; textSize = 24f; setTypeface(typeface, Typeface.BOLD) }
-        root.addView(value)
-        valueViews[key] = value
-        if (withRaw) {
-            val raw = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE; alpha = 0.6f }
-            root.addView(raw)
-            rawViews[key] = raw
+    private fun buildUi(): View {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.BG) }
+
+        // Шапка
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(kit.dp(16), kit.dp(12), kit.dp(12), kit.dp(8))
         }
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titles.addView(kit.text("BYD e2 · диагностика", 18f, Palette.TEXT, true))
+        connView = kit.text("", 13f, Palette.SUB)
+        taskView = kit.text("", 12f, Palette.WARN).apply { visibility = View.GONE }
+        recBadge = kit.text("● Идёт запись", 12f, Palette.BAD, true).apply { visibility = View.GONE }
+        titles.addView(connView); titles.addView(recBadge); titles.addView(taskView)
+        head.addView(titles, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        stopBtn = kit.button("Стоп") { cancel = true; taskView.text = "Останавливаю…" }.apply { visibility = View.GONE }
+        head.addView(stopBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = kit.dp(8) })
+        connectBtn = kit.button("Подключить", primary = true) { onConnectClick() }
+        head.addView(connectBtn)
+        root.addView(head)
+
+        // Содержимое вкладок
+        val content = FrameLayout(this)
+        root.addView(content, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        val pages = listOf(
+            "Батарея" to buildBatteryTab(),
+            "Модули" to buildModulesTab(),
+            "Ошибки" to buildDtcTab(),
+            "Блоки" to buildEcuTab(),
+            "Сервис" to buildServiceTab(),
+        )
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Palette.TAB_BG) }
+        pages.forEachIndexed { i, (name, page) ->
+            content.addView(page, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            val label = kit.tabLabel(name).apply { setOnClickListener { selectTab(i) } }
+            bar.addView(label, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            tabs += label to page
+        }
+        root.addView(bar)
+        return root
+    }
+
+    private fun selectTab(index: Int) {
+        tabs.forEachIndexed { i, (label, page) ->
+            val on = i == index
+            page.visibility = if (on) View.VISIBLE else View.GONE
+            label.setTextColor(if (on) Palette.ACCENT else Palette.SUB)
+            label.setTypeface(null, if (on) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
+        }
+        if (index == 4) renderFiles()
+    }
+
+    private fun page(): Pair<ScrollView, LinearLayout> {
+        val inner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(kit.dp(12), kit.dp(4), kit.dp(12), kit.dp(12))
+        }
+        val sv = ScrollView(this).apply { addView(inner) }
+        return sv to inner
+    }
+
+    private fun addTiles(card: LinearLayout, items: List<Pair<String, String>>) {
+        for (pair in items.chunked(2)) {
+            val views = pair.map { (key, title) ->
+                val t = kit.tile(title)
+                t.raw.visibility = if (showRaw) View.VISIBLE else View.GONE
+                tiles[key] = t
+                t.root
+            }
+            card.addView(kit.row(*views.toTypedArray()))
+        }
+    }
+
+    // ---------- Вкладка «Батарея»
+    private fun buildBatteryTab(): View {
+        val (sv, p) = page()
+
+        val socCard = kit.card(null)
+        socCard.addView(kit.text("Заряд", 13f, Palette.SUB))
+        socBig = kit.text("—", 44f, Palette.TEXT, true)
+        socSub = kit.text("", 12f, Palette.SUB)
+        socBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            progressTintList = ColorStateList.valueOf(Palette.ACCENT)
+        }
+        socCard.addView(socBig); socCard.addView(socSub)
+        socCard.addView(socBar, LinearLayout.LayoutParams(MATCH_PARENT, kit.dp(10)).apply { topMargin = kit.dp(8) })
+        p.addView(socCard)
+
+        val rec = kit.card("Запись данных")
+        recStatus = kit.note("Значения сохраняются в CSV-файл (открывается в Excel и Google Таблицах).")
+        rec.addView(recStatus)
+        recBtn = kit.button("Начать запись", primary = true) { onRecordClick() }
+        rec.addView(recBtn)
+        p.addView(rec)
+
+        val now = kit.card("Сейчас")
+        addTiles(now, listOf(
+            "volt" to "Напряжение", "amp" to "Ток (− заряд)",
+            "power" to "Мощность", "mode" to "Режим",
+            "temp" to "Температура", "crate" to "C-rate",
+        ))
+        p.addView(now)
+
+        val cells = kit.card("Ячейки")
+        addTiles(cells, listOf("cell_min" to "Минимальная", "cell_max" to "Максимальная", "cell_dv" to "Разброс ΔV"))
+        p.addView(cells)
+
+        val temps = kit.card("Температуры")
+        addTiles(temps, listOf("t_min" to "Минимальная", "t_max" to "Максимальная", "t_dt" to "Разброс ΔT"))
+        p.addView(temps)
+
+        val cap = kit.card("Ёмкость и ресурс")
+        cap.addView(kit.note("Значения с пометкой «вероятно» расшифрованы по косвенным признакам."))
+        addTiles(cap, listOf(
+            "cap_act" to "Фактическая ёмкость (вероятно)", "cap" to "Номинальная (вероятно)",
+            "soh" to "SOH (фактич. / номинал)", "p0029" to "Параметр 0029 (SOH?)",
+            "ah_out" to "Отдано всего (вероятно)", "ah_in" to "Получено всего (вероятно)",
+            "cycles" to "Эквивалент циклов", "e_life" to "Получено, кВт·ч ≈",
+        ))
+        p.addView(cap)
+
+        val energy = kit.card("Энергия")
+        addTiles(energy, listOf(
+            "e_full" to "Запас при 100 %", "e_left" to "Осталось",
+            "e_in" to "Получено с сброса", "e_out" to "Отдано с сброса",
+        ))
+        energy.addView(kit.button("Сбросить счётчики энергии") { energyIn = 0.0; energyOut = 0.0; renderEnergy() })
+        p.addView(energy)
+        return sv
+    }
+
+    // ---------- Вкладка «Модули»
+    private fun buildModulesTab(): View {
+        val (sv, p) = page()
+        val c = kit.card("Модули батареи")
+        c.addView(kit.note("Мин/макс ячейка и температура каждого из 7 модулей (016C–01A3). Номера ячеек — внутри модуля."))
+        c.addView(kit.button("Прочитать модули и ячейки", primary = true) { readModules() })
+        moduleView = kit.mono().apply { setPadding(0, kit.dp(10), 0, 0) }
+        c.addView(HorizontalScrollView(this).apply { addView(moduleView) })
+        p.addView(c)
+
+        val c2 = kit.card("Параметр ячеек 0040–0099")
+        c2.addView(kit.note("По одному значению на каждую из 90 ячеек. Смысл пока неизвестен, при зарядке не меняется. " +
+            "Полезно сохранять и сравнивать раз в несколько месяцев."))
+        cellView = kit.mono()
+        c2.addView(HorizontalScrollView(this).apply { addView(cellView) })
+        p.addView(c2)
+        return sv
+    }
+
+    // ---------- Вкладка «Ошибки»
+    private fun buildDtcTab(): View {
+        val (sv, p) = page()
+        val c = kit.card("Коды неисправностей")
+        c.addView(kit.note("Блок:"))
+        dtcSpinner = Spinner(this)
+        c.addView(dtcSpinner)
+        c.addView(kit.spacer(8))
+        c.addView(kit.row(
+            kit.button("Прочитать", primary = true) { readDtcSelected() },
+            kit.button("Сбросить") { confirmClearDtc() }
+        ))
+        c.addView(kit.button("Проверить все блоки") { readDtcAll() })
+        c.addView(kit.note("\nСбрасывайте ошибки только после того, как записали их и поняли причину. " +
+            "Если неисправность настоящая, ошибка появится снова."))
+        p.addView(c)
+        dtcList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        p.addView(dtcList)
+        return sv
+    }
+
+    // ---------- Вкладка «Блоки»
+    private fun buildEcuTab(): View {
+        val (sv, p) = page()
+        val c = kit.card("Блоки автомобиля")
+        c.addView(kit.note("Поиск перебирает адреса 700–7FF безопасным запросом «на связи?» и читает " +
+            "идентификаторы ответивших блоков. Машина в режиме READY, около 2–3 минут."))
+        c.addView(kit.button("Найти блоки", primary = true) { confirmDiscover() })
+        p.addView(c)
+        ecuList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        p.addView(ecuList)
+
+        val o = kit.card("Стандартный OBD-II")
+        o.addView(kit.note("Проверяет, какие стандартные параметры (скорость, 12 В, одометр и т.п.) отдаёт машина."))
+        o.addView(kit.button("Проверить OBD-II") { obdCheck() })
+        obdView = kit.mono().apply { setPadding(0, kit.dp(10), 0, 0) }
+        o.addView(obdView)
+        p.addView(o)
+        return sv
+    }
+
+    // ---------- Вкладка «Сервис»
+    private fun buildServiceTab(): View {
+        val (sv, p) = page()
+
+        val s = kit.card("Настройки")
+        val headerInput = EditText(this).apply {
+            setText(header)
+            setTextColor(Palette.TEXT)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        val cellsInput = EditText(this).apply {
+            setText(cellCount.toString())
+            setTextColor(Palette.TEXT)
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val l1 = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        l1.addView(kit.text("Адрес BMS", 12f, Palette.SUB)); l1.addView(headerInput)
+        val l2 = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        l2.addView(kit.text("Число ячеек", 12f, Palette.SUB)); l2.addView(cellsInput)
+        s.addView(kit.row(l1, l2))
+        watch(headerInput) {
+            header = it.trim().uppercase().ifEmpty { "7E7" }
+            savePrefs(); refreshTargets()
+        }
+        watch(cellsInput) {
+            cellCount = it.trim().toIntOrNull()?.takeIf { n -> n in 1..400 } ?: 90
+            savePrefs()
+        }
+        s.addView(CheckBox(this).apply {
+            text = "Показывать сырые ответы под значениями"
+            setTextColor(Palette.TEXT)
+            isChecked = showRaw
+            setOnCheckedChangeListener { _, checked ->
+                showRaw = checked; savePrefs()
+                tiles.values.forEach { t -> t.raw.visibility = if (checked) View.VISIBLE else View.GONE }
+            }
+        })
+        s.addView(CheckBox(this).apply {
+            text = "Подробный журнал"
+            setTextColor(Palette.TEXT)
+            setOnCheckedChangeListener { _, checked -> verbose = checked }
+        })
+        p.addView(s)
+
+        val sc = kit.card("Сканер BMS")
+        sc.addView(kit.note("Перебирает идентификаторы BMS (только чтение) и сохраняет ответы в файл. " +
+            "Сканер других блоков — на вкладке «Блоки»."))
+        sc.addView(kit.row(
+            kit.button("Запустить скан", primary = true) { askScan(bms()) },
+            kit.button("Отправить файл") { lastScanFile?.let { shareFile(it) } ?: toast("Скан ещё не выполнялся") }
+        ))
+        p.addView(sc)
+
+        val t = kit.card("Терминал")
+        t.addView(kit.note("Команды ELM327 (AT…) или запросы UDS (например 220005) выбранному блоку."))
+        termSpinner = Spinner(this)
+        t.addView(termSpinner)
+        termInput = EditText(this).apply {
+            hint = "220005"
+            setTextColor(Palette.TEXT)
+            setHintTextColor(Palette.SUB)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        val sendBtn = kit.button("Отправить", primary = true) { sendTerminal() }
+        val tr = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        tr.addView(termInput, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        tr.addView(sendBtn)
+        t.addView(tr)
+        p.addView(t)
+
+        val fc = kit.card("Сохранённые файлы")
+        fc.addView(kit.note("Записи данных (CSV), сканы, отчёты об ошибках, блоках и модулях."))
+        fc.addView(kit.button("Обновить список") { renderFiles() })
+        filesList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, kit.dp(8), 0, 0) }
+        fc.addView(filesList)
+        p.addView(fc)
+
+        val lg = kit.card("Журнал")
+        lg.addView(kit.row(
+            kit.button("Поделиться") { shareLog() },
+            kit.button("Очистить") { logLines.clear(); logView.text = "" }
+        ))
+        logView = kit.mono(10f)
+        lg.addView(logView)
+        p.addView(lg)
+        return sv
     }
 
     private fun watch(edit: EditText, onChange: (String) -> Unit) {
@@ -123,133 +435,44 @@ class MainActivity : Activity() {
         })
     }
 
-    private fun buildUi(): ScrollView {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+    private fun refreshTargets() {
+        val names = targets().map { it.label }
+        for (sp in listOf(dtcSpinner, termSpinner)) {
+            val pos = sp.selectedItemPosition
+            sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+            if (pos in names.indices) sp.setSelection(pos)
         }
-
-        statusView = TextView(this).apply { textSize = 16f; setTypeface(typeface, Typeface.BOLD) }
-        root.addView(statusView)
-
-        val settingsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        settingsRow.addView(TextView(this).apply { text = "BMS: " })
-        headerInput = EditText(this).apply {
-            setText(header)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
-            minEms = 3
-        }
-        settingsRow.addView(headerInput)
-        settingsRow.addView(TextView(this).apply { text = "   Ячеек: " })
-        cellsInput = EditText(this).apply {
-            setText(cellCount.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER
-            minEms = 2
-        }
-        settingsRow.addView(cellsInput)
-        root.addView(settingsRow)
-        watch(headerInput) { header = it.trim().uppercase().ifEmpty { "7E7" } }
-        watch(cellsInput) { cellCount = it.trim().toIntOrNull()?.takeIf { n -> n in 1..400 } ?: 90 }
-
-        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        connectBtn = Button(this).apply { text = "Подключить"; setOnClickListener { onConnectClick() } }
-        pollBtn = Button(this).apply { text = "Старт опроса"; isEnabled = false; setOnClickListener { togglePolling() } }
-        btnRow.addView(connectBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        btnRow.addView(pollBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        root.addView(btnRow)
-
-        // --- Основное
-        section(root, "Батарея")
-        for (p in PARAMS.filter { it.group == G_MAIN }) valueRow(root, p.key, "${p.title}  [22 ${p.did}]", true)
-
-        // --- Ячейки и температуры
-        section(root, "Ячейки и температуры")
-        valueRow(root, "cell_min", "Минимальная ячейка  [002A/002B]", false)
-        valueRow(root, "cell_max", "Максимальная ячейка  [002C/002D]", false)
-        valueRow(root, "cell_dv", "Разброс ячеек ΔV", false)
-        valueRow(root, "t_min", "Минимальная температура  [002E/002F]", false)
-        valueRow(root, "t_max", "Максимальная температура  [0030/0031]", false)
-        valueRow(root, "t_dt", "Разброс температур ΔT", false)
-
-        // --- Ёмкость и ресурс
-        section(root, "Ёмкость и ресурс")
-        for (p in PARAMS.filter { it.group == G_CAP }) valueRow(root, p.key, "${p.title}  [22 ${p.did}]", true)
-        valueRow(root, "soh", "SOH ≈ фактическая / номинальная ёмкость", false)
-        valueRow(root, "cycles", "Эквивалент полных циклов (получено / номинал)", false)
-        valueRow(root, "e_life", "Получено за всё время, примерно", false)
-
-        // --- Мощность и энергия
-        section(root, "Мощность и энергия")
-        valueRow(root, "power", "Мощность (U × I)", false)
-        valueRow(root, "mode", "Режим", false)
-        valueRow(root, "crate", "C-rate (ток / ёмкость)", false)
-        valueRow(root, "e_full", "Запас энергии при 100 % (ёмкость × ячеек × 3,2 В)", false)
-        valueRow(root, "e_left", "Осталось энергии", false)
-        valueRow(root, "e_in", "Получено батареей с момента сброса", false)
-        valueRow(root, "e_out", "Отдано батареей с момента сброса", false)
-        root.addView(Button(this).apply {
-            text = "Сбросить счётчики энергии"
-            setOnClickListener { energyIn = 0.0; energyOut = 0.0; renderEnergy() }
-        })
-
-        // --- Модули и ячейки
-        section(root, "Модули и ячейки")
-        root.addView(TextView(this).apply {
-            textSize = 13f
-            text = "Сводка по 7 модулям (016C–01A3) и неизвестный параметр каждой из 90 ячеек (0040–0099). " +
-                "Чтение занимает 10–20 секунд."
-        })
-        root.addView(Button(this).apply { text = "Прочитать модули и ячейки"; setOnClickListener { readModules() } })
-        moduleView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f; setTextIsSelectable(true) }
-        root.addView(HorizontalScrollView(this).apply { addView(moduleView) })
-
-        // --- Сканер
-        section(root, "Сканер BMS")
-        root.addView(TextView(this).apply {
-            textSize = 13f
-            text = "Перебирает идентификаторы (только чтение, сервис 22) по адресу BMS и сохраняет все ответы в файл. " +
-                "Зажигание должно быть включено. Полезно сделать два скана: в покое и во время зарядки."
-        })
-        val scanRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        scanBtn = Button(this).apply { text = "Запустить скан"; setOnClickListener { onScanClick() } }
-        scanRow.addView(scanBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        scanRow.addView(Button(this).apply {
-            text = "Отправить файл"
-            setOnClickListener { lastScanFile?.let { shareFile(it) } ?: toast("Скан ещё не выполнялся") }
-        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        root.addView(scanRow)
-
-        // --- Терминал и лог
-        section(root, "Терминал")
-        val termRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        termInput = EditText(this).apply {
-            hint = "например 220005 или ATDPN"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
-        }
-        termRow.addView(termInput, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        termRow.addView(Button(this).apply { text = "Отправить"; setOnClickListener { sendTerminal() } })
-        root.addView(termRow)
-
-        val logBtnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val verboseBox = CheckBox(this).apply {
-            text = "Подробный лог"
-            setOnCheckedChangeListener { _, checked -> verbose = checked }
-        }
-        logBtnRow.addView(verboseBox, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        logBtnRow.addView(Button(this).apply { text = "Поделиться"; setOnClickListener { shareLog() } })
-        logBtnRow.addView(Button(this).apply { text = "Очистить"; setOnClickListener { logLines.clear(); logView.text = "" } })
-        root.addView(logBtnRow)
-
-        logView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f; setTextIsSelectable(true) }
-        logScroll = ScrollView(this).apply { addView(logView) }
-        root.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, dp(300)))
-
-        return ScrollView(this).apply { addView(root) }
     }
 
-    private fun setStatus(s: String) { ui.post { statusView.text = s } }
+    // ---------- Общие помощники UI
 
-    private fun setValue(key: String, text: String) { ui.post { valueViews[key]?.text = text } }
+    private fun setConn(connected: Boolean, text: String) {
+        ui.post {
+            connView.text = "● $text"
+            connView.setTextColor(if (connected) Palette.ACCENT else Palette.SUB)
+        }
+    }
+
+    private fun setTask(text: String?) {
+        ui.post {
+            if (text == null) {
+                taskView.visibility = View.GONE
+                stopBtn.visibility = View.GONE
+            } else {
+                taskView.text = text
+                taskView.visibility = View.VISIBLE
+                stopBtn.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun setValue(key: String, text: String, color: Int = Palette.TEXT) {
+        ui.post { tiles[key]?.value?.apply { this.text = text; setTextColor(color) } }
+    }
+
+    private fun setRaw(key: String, text: String) {
+        ui.post { tiles[key]?.raw?.text = text }
+    }
 
     private fun log(s: String) {
         val line = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + "  " + s
@@ -257,7 +480,6 @@ class MainActivity : Activity() {
             logLines.addLast(line)
             while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
             logView.text = logLines.joinToString("\n")
-            logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
         }
     }
 
@@ -267,13 +489,13 @@ class MainActivity : Activity() {
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_TEXT, logLines.joinToString("\n"))
-        }, "Отправить лог"))
+        }, "Отправить журнал"))
     }
 
     private fun shareFile(file: File) {
         val uri = ScanFileProvider.uriFor(file)
         val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
+            type = if (file.name.endsWith(".csv")) "text/csv" else "text/plain"
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, file.name)
             clipData = ClipData.newRawUri(file.name, uri)
@@ -282,7 +504,27 @@ class MainActivity : Activity() {
         startActivity(Intent.createChooser(intent, "Отправить ${file.name}"))
     }
 
-    // ---------------------------------------------------------------- Bluetooth
+    private fun saveText(prefix: String, text: String): File? = try {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        File(ScanFileProvider.dir(this), "${prefix}_$stamp.txt").apply { writeText(text) }
+    } catch (ex: Exception) {
+        log("Не удалось сохранить файл: ${ex.message}")
+        null
+    }
+
+    private fun offerShare(title: String, file: File) {
+        ui.post {
+            lastScanFile = file
+            AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage("Файл ${file.name} сохранён. Отправить его?")
+                .setPositiveButton("Отправить") { _, _ -> shareFile(file) }
+                .setNegativeButton("Позже", null)
+                .show()
+        }
+    }
+
+    // =================================================================== Bluetooth
 
     private fun onConnectClick() {
         if (elm != null) { disconnect(); return }
@@ -359,35 +601,33 @@ class MainActivity : Activity() {
 
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
-        val h = header
         val name = device.name ?: device.address
         connectBtn.isEnabled = false
-        setStatus("Подключение к $name…")
+        setConn(false, "Подключение к $name…")
         worker.execute {
             try {
                 val e = Elm327(openSocket(device))
                 elm = e
+                selectedEcu = null
+                craSupported = true
                 log("Bluetooth подключён, инициализация ELM327")
-                val init = listOf(
-                    "ATZ", "ATE0", "ATL0", "ATH0", "ATSP6", "ATAT1", "ATST96",
-                    "ATSH$h", "ATFCSH$h", "ATFCSD300000", "ATFCSM1"
-                )
+                val init = listOf("ATZ", "ATE0", "ATL0", "ATH0", "ATSP6", "ATAT1", "ATST96", "ATFCSD300000", "ATFCSM1")
                 for (cmd in init) {
                     val r = e.send(cmd, if (cmd == "ATZ") 5000 else 2000)
                     log("$cmd → ${r.replace("\n", " | ")}")
                 }
+                select(e, bms())
                 log("ATDPN → " + e.send("ATDPN"))
                 log("Напряжение 12 В: " + e.send("ATRV"))
-                setStatus("Подключено: $name")
+                setConn(true, "Подключено: $name")
                 ui.post {
                     connectBtn.text = "Отключить"
                     connectBtn.isEnabled = true
-                    pollBtn.isEnabled = true
                 }
                 startPolling()
             } catch (ex: Exception) {
                 log("Ошибка: ${ex.message}")
-                setStatus("Ошибка подключения")
+                setConn(false, "Ошибка подключения")
                 closeQuietly()
                 ui.post { connectBtn.isEnabled = true; connectBtn.text = "Подключить" }
             }
@@ -395,56 +635,98 @@ class MainActivity : Activity() {
     }
 
     private fun disconnect() {
-        scanStop = true
+        if (recorder.active) stopRecording()
+        cancel = true
         stopPolling()
         worker.execute {
             closeQuietly()
             log("Отключено")
-            setStatus("Не подключено")
-            ui.post {
-                connectBtn.text = "Подключить"
-                pollBtn.isEnabled = false
-            }
+            setConn(false, "Не подключено")
+            ui.post { connectBtn.text = "Подключить" }
         }
     }
 
     private fun closeQuietly() {
         elm?.close()
         elm = null
+        selectedEcu = null
     }
 
     private fun onConnectionLost(ex: Exception) {
-        log("Связь потеряна: ${ex.message}")
-        setStatus("Связь потеряна")
+        recorder.flush()
+        log("Связь потеряна: ${ex.message}" + if (recorder.active) " (запись продолжится после переподключения)" else "")
+        setConn(false, "Связь потеряна")
         stopPolling()
         closeQuietly()
-        ui.post { connectBtn.text = "Подключить"; connectBtn.isEnabled = true; pollBtn.isEnabled = false }
+        ui.post { connectBtn.text = "Подключить"; connectBtn.isEnabled = true }
     }
 
-    // ---------------------------------------------------------------- Опрос
+    // =================================================================== Работа с адаптером
 
-    private fun togglePolling() {
-        if (pollTask == null) startPolling() else stopPolling()
+    /** Направляет запросы указанному блоку (адрес запроса, приём ответов, flow control). */
+    private fun select(e: Elm327, ecu: Ecu) {
+        val cur = selectedEcu
+        if (cur != null && cur.req == ecu.req && cur.resp == ecu.resp) return
+        val h = "%03X".format(ecu.req)
+        e.send("ATSH$h")
+        e.send("ATFCSH$h")
+        if (craSupported) {
+            val r = e.send("ATCRA%03X".format(ecu.resp))
+            if (r.contains("?")) {
+                craSupported = false
+                e.send("ATAR")
+                log("Адаптер не поддерживает ATCRA — используется автоприём (блоки вне 7E0–7E7 могут не отвечать)")
+            }
+        }
+        selectedEcu = ecu
     }
+
+    /** Возвращает адаптер к базовым настройкам после нестандартных операций. */
+    private fun restoreBase(e: Elm327) {
+        for (cmd in listOf("ATH0", "ATCRA", "ATAR", "ATST96", "ATFCSD300000", "ATFCSM1")) e.send(cmd)
+        selectedEcu = null
+    }
+
+    /** Выполняет длинную операцию на рабочем потоке; опрос на это время приостанавливается. */
+    private fun runTask(name: String, block: (Elm327) -> Unit) {
+        val e = elm
+        if (e == null) { toast("Сначала подключитесь к адаптеру"); return }
+        if (busy) { toast("Подождите, выполняется другая операция"); return }
+        busy = true
+        cancel = false
+        setTask(name)
+        worker.execute {
+            try {
+                block(e)
+            } catch (ex: IOException) {
+                onConnectionLost(ex)
+            } catch (ex: Exception) {
+                log("Ошибка: ${ex.message}")
+            } finally {
+                busy = false
+                setTask(null)
+            }
+        }
+    }
+
+    // =================================================================== Опрос BMS
 
     private fun startPolling() {
-        if (pollTask != null || scanning) return
+        if (pollTask != null) return
         lastPollMs = 0L
         pollTask = worker.scheduleWithFixedDelay({ pollOnce() }, 0, 1000, TimeUnit.MILLISECONDS)
-        ui.post { pollBtn.text = "Стоп опроса" }
     }
 
     private fun stopPolling() {
         pollTask?.cancel(false)
         pollTask = null
-        ui.post { pollBtn.text = "Старт опроса" }
     }
 
     private fun pollOnce() {
         val e = elm ?: return
-        if (scanning) return
+        if (busy) { lastPollMs = 0L; return }
         try {
-            // один запрос на идентификатор, даже если из него читается несколько параметров
+            select(e, bms())
             val responses = LinkedHashMap<String, UdsResult>()
             for (did in PARAMS.map { it.did }.distinct()) {
                 val raw = e.send("22$did")
@@ -457,12 +739,12 @@ class MainActivity : Activity() {
                         val v = p.decode(r.data)
                         values[p.key] = v
                         setValue(p.key, if (v == null) "—" else "%.${p.decimals}f %s".format(v, p.unit).trim())
-                        ui.post { rawViews[p.key]?.text = r.rawHex }
+                        setRaw(p.key, "22 ${p.did}: ${r.rawHex}")
                     }
                     is UdsResult.Error -> {
                         values[p.key] = null
                         setValue(p.key, "—")
-                        ui.post { rawViews[p.key]?.text = r.message }
+                        setRaw(p.key, "22 ${p.did}: ${r.message}")
                     }
                     null -> {}
                 }
@@ -477,58 +759,173 @@ class MainActivity : Activity() {
 
     private fun updateDerived() {
         val now = System.currentTimeMillis()
-        val soc = values["soc"] ?: values["soc_d"]
+        val socD = values["soc_d"]
+        val soc = values["soc"] ?: socD
         val capAct = values["cap_act"]
         val capNom = values["cap"]
         val cap = capAct ?: capNom
         val u = values["volt"]
         val i = values["amp"]
 
+        ui.post {
+            socBig.text = if (socD != null) "%.0f %%".format(socD) else if (soc != null) "%.1f %%".format(soc) else "—"
+            socSub.text = if (values["soc"] != null) "BMS: %.2f %%".format(values["soc"]) else ""
+            socBar.progress = ((soc ?: 0.0) * 10).toInt().coerceIn(0, 1000)
+        }
+
         val power = if (u != null && i != null) u * i / 1000.0 else null
         setValue("power", fmt(power, "%.2f кВт"))
+        when {
+            i == null -> setValue("mode", "—")
+            i > 0.5 -> setValue("mode", "разряд", Palette.WARN)
+            i < -0.5 -> setValue("mode", "заряд", Palette.ACCENT)
+            else -> setValue("mode", "покой")
+        }
+        setValue("crate", if (i != null && cap != null && cap > 0) "%.3f C".format(i / cap) else "—")
 
-        setValue("mode", when {
-            i == null -> "—"
-            i > 0.5 -> "разряд"
-            i < -0.5 -> "заряд"
-            else -> "покой"
-        })
+        val cminV = values["cmin_v"]; val cmaxV = values["cmax_v"]
+        setValue("cell_min", if (cminV != null) "%.3f В №%d".format(cminV, (values["cmin_n"] ?: 0.0).toInt()) else "—")
+        setValue("cell_max", if (cmaxV != null) "%.3f В №%d".format(cmaxV, (values["cmax_n"] ?: 0.0).toInt()) else "—")
+        if (cminV != null && cmaxV != null) {
+            val dv = (cmaxV - cminV) * 1000
+            setValue("cell_dv", "%.0f мВ".format(dv), when { dv <= 15 -> Palette.ACCENT; dv <= 40 -> Palette.WARN; else -> Palette.BAD })
+        } else setValue("cell_dv", "—")
 
-        val cminN = values["cmin_n"]; val cminV = values["cmin_v"]
-        val cmaxN = values["cmax_n"]; val cmaxV = values["cmax_v"]
-        setValue("cell_min", if (cminV != null) "%.3f В  (№%d)".format(cminV, (cminN ?: 0.0).toInt()) else "—")
-        setValue("cell_max", if (cmaxV != null) "%.3f В  (№%d)".format(cmaxV, (cmaxN ?: 0.0).toInt()) else "—")
-        setValue("cell_dv", if (cminV != null && cmaxV != null) "%.0f мВ".format((cmaxV - cminV) * 1000) else "—")
+        val tmin = values["tmin"]; val tmax = values["tmax"]
+        setValue("t_min", if (tmin != null) "%.0f °C д.%d".format(tmin, (values["tmin_n"] ?: 0.0).toInt()) else "—")
+        setValue("t_max", if (tmax != null) "%.0f °C д.%d".format(tmax, (values["tmax_n"] ?: 0.0).toInt()) else "—")
+        if (tmin != null && tmax != null) {
+            val dt = tmax - tmin
+            setValue("t_dt", "%.0f °C".format(dt), when { dt <= 3 -> Palette.ACCENT; dt <= 6 -> Palette.WARN; else -> Palette.BAD })
+        } else setValue("t_dt", "—")
 
-        val tminN = values["tmin_n"]; val tmin = values["tmin"]
-        val tmaxN = values["tmax_n"]; val tmax = values["tmax"]
-        setValue("t_min", if (tmin != null) "%.0f °C  (датчик %d)".format(tmin, (tminN ?: 0.0).toInt()) else "—")
-        setValue("t_max", if (tmax != null) "%.0f °C  (датчик %d)".format(tmax, (tmaxN ?: 0.0).toInt()) else "—")
-        setValue("t_dt", if (tmin != null && tmax != null) "%.0f °C".format(tmax - tmin) else "—")
-
+        val soh = if (capAct != null && capNom != null && capNom > 0) capAct / capNom * 100 else null
+        setValue("soh", fmt(soh, "%.1f %%"))
         val ahIn = values["ah_in"]
         setValue("cycles", if (ahIn != null && capNom != null && capNom > 0) "%.0f".format(ahIn / capNom) else "—")
         setValue("e_life", if (ahIn != null) "%.0f кВт·ч".format(ahIn * cellCount * CELL_NOMINAL_V / 1000.0) else "—")
 
-        setValue("crate", if (i != null && cap != null && cap > 0) "%.3f C".format(i / cap) else "—")
-
-        val soh = if (capAct != null && capNom != null && capNom > 0) capAct / capNom * 100 else null
-        setValue("soh", fmt(soh, "%.1f %%"))
-
         val eFull = cap?.let { it * cellCount * CELL_NOMINAL_V / 1000.0 }
         setValue("e_full", fmt(eFull, "%.1f кВт·ч"))
-        val eLeft = if (eFull != null && soc != null) eFull * soc / 100.0 else null
-        setValue("e_left", fmt(eLeft, "%.1f кВт·ч"))
+        setValue("e_left", if (eFull != null && soc != null) "%.1f кВт·ч".format(eFull * soc / 100.0) else "—")
 
         if (power != null && lastPollMs > 0) {
             val dtMs = now - lastPollMs
-            if (dtMs in 1..10_000) { // большие паузы (скан, обрыв связи) не считаем
+            if (dtMs in 1..10_000) {
                 val kwh = power * dtMs / 3_600_000.0
                 if (kwh >= 0) energyOut += kwh else energyIn += -kwh
             }
         }
         lastPollMs = now
         renderEnergy()
+
+        if (recorder.active) {
+            val row = HashMap<String, Double?>(values)
+            row["power_kw"] = power
+            row["dv_mv"] = if (cminV != null && cmaxV != null) (cmaxV - cminV) * 1000 else null
+            row["dt_c"] = if (tmin != null && tmax != null) tmax - tmin else null
+            row["soh"] = soh
+            row["e_left_kwh"] = if (eFull != null && soc != null) eFull * soc / 100.0 else null
+            row["e_in_kwh"] = energyIn
+            row["e_out_kwh"] = energyOut
+            try {
+                if (recorder.maybeWrite(now, row)) renderRecStatus()
+            } catch (ex: Exception) {
+                log("Ошибка записи: ${ex.message}")
+                recorder.stop()
+                renderRecStatus()
+            }
+        }
+    }
+
+    // =================================================================== Запись данных
+
+    private fun onRecordClick() {
+        if (recorder.active) { stopRecording(); return }
+        val options = arrayOf("Каждую секунду", "Каждые 5 секунд", "Каждые 30 секунд", "Каждую минуту")
+        val intervals = longArrayOf(1000, 5000, 30_000, 60_000)
+        AlertDialog.Builder(this)
+            .setTitle("Как часто записывать?")
+            .setItems(options) { _, which ->
+                try {
+                    val f = recorder.start(intervals[which])
+                    log("Запись начата: ${f.name} (${options[which].lowercase()})")
+                    if (elm == null) toast("Запись начнётся после подключения к адаптеру")
+                } catch (ex: Exception) {
+                    toast("Не удалось создать файл: ${ex.message}")
+                }
+                renderRecStatus()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun stopRecording() {
+        val f = recorder.stop()
+        renderRecStatus()
+        if (f != null) {
+            log("Запись остановлена: ${f.name}, строк ${recorder.rows}")
+            offerShare("Запись остановлена", f)
+        }
+    }
+
+    private fun renderRecStatus() {
+        ui.post {
+            val f = recorder.file
+            if (recorder.active && f != null) {
+                val sec = (System.currentTimeMillis() - recorder.startMs) / 1000
+                recStatus.text = "Идёт запись: %02d:%02d:%02d, строк %d\n%s, %.1f КБ".format(
+                    sec / 3600, sec / 60 % 60, sec % 60, recorder.rows, f.name, f.length() / 1024.0)
+                recStatus.setTextColor(Palette.TEXT)
+                recBtn.text = "Остановить запись"
+                recBadge.visibility = View.VISIBLE
+            } else {
+                recStatus.text = "Значения сохраняются в CSV-файл (открывается в Excel и Google Таблицах)."
+                recStatus.setTextColor(Palette.SUB)
+                recBtn.text = "Начать запись"
+                recBadge.visibility = View.GONE
+            }
+        }
+    }
+
+    // =================================================================== Файлы
+
+    private fun renderFiles() {
+        filesList.removeAllViews()
+        val files = ScanFileProvider.dir(this).listFiles { f -> f.isFile && f.name.startsWith("byd_") }
+            ?.sortedByDescending { it.lastModified() } ?: emptyList()
+        if (files.isEmpty()) {
+            filesList.addView(kit.note("Файлов пока нет."))
+            return
+        }
+        val df = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US)
+        for (f in files.take(60)) {
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = kit.rounded(Palette.TILE, 10)
+                setPadding(kit.dp(10), kit.dp(8), kit.dp(10), kit.dp(8))
+                layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = kit.dp(8) }
+            }
+            box.addView(kit.text(f.name, 13f, Palette.TEXT, true))
+            box.addView(kit.text("%s · %.1f КБ".format(df.format(Date(f.lastModified())), f.length() / 1024.0), 11f, Palette.SUB))
+            val recording = recorder.active && recorder.file == f
+            box.addView(kit.row(
+                kit.button("Отправить") {
+                    if (recording) recorder.flush()
+                    shareFile(f)
+                },
+                kit.button(if (recording) "Идёт запись" else "Удалить") {
+                    if (recording) return@button
+                    AlertDialog.Builder(this)
+                        .setTitle("Удалить файл?")
+                        .setMessage(f.name)
+                        .setPositiveButton("Удалить") { _, _ -> f.delete(); renderFiles() }
+                        .setNegativeButton("Отмена", null)
+                        .show()
+                }
+            ).apply { setPadding(0, kit.dp(6), 0, 0) })
+            filesList.addView(box)
+        }
     }
 
     private fun renderEnergy() {
@@ -536,202 +933,411 @@ class MainActivity : Activity() {
         setValue("e_out", "%.3f кВт·ч".format(energyOut))
     }
 
-    // ---------------------------------------------------------------- Модули и ячейки
+    // =================================================================== Модули
+
+    private fun readDid(e: Elm327, did: Int): IntArray? {
+        val h = "%04X".format(did)
+        return (Uds.parse(e.send("22$h"), h) as? UdsResult.Ok)?.data
+    }
 
     private fun readModules() {
-        val e = elm
-        if (e == null) { toast("Сначала подключитесь к адаптеру"); return }
-        if (scanning) { toast("Дождитесь окончания скана"); return }
         moduleView.text = "Чтение…"
-        worker.execute {
-            fun rd(did: Int): IntArray? {
-                val h = "%04X".format(did)
-                return (Uds.parse(e.send("22$h"), h) as? UdsResult.Ok)?.data
+        runTask("Чтение модулей и ячеек") { e ->
+            select(e, bms())
+            val sb = StringBuilder()
+            sb.append("Мод  мин.ячейка   макс.ячейка   ΔV      темп.\n")
+            for (m in 0 until MODULE_COUNT) {
+                if (cancel) break
+                val base = MODULE_BASE + m * 8
+                val v = (0 until 8).map { readDid(e, base + it) }
+                val nMin = v[0]?.getOrNull(0); val vMin = v[1]?.let { le16(it, 0) }
+                val nMax = v[2]?.getOrNull(0); val vMax = v[3]?.let { le16(it, 0) }
+                val tMin = v[5]?.getOrNull(0)?.let { it - 40 }
+                val tMax = v[7]?.getOrNull(0)?.let { it - 40 }
+                fun cell(n: Int?, mv: Int?) = if (n == null || mv == null) "  ?          " else "#%-2d %.3f В".format(n + 1, mv / 1000.0)
+                val dv = if (vMin != null && vMax != null) "%3d мВ".format(vMax - vMin) else "  ?   "
+                val t = if (tMin != null && tMax != null) (if (tMin == tMax) "$tMin °C" else "$tMin…$tMax °C") else "?"
+                sb.append("%-4d %s  %s  %s  %s\n".format(m + 1, cell(nMin, vMin), cell(nMax, vMax), dv, t))
             }
-            try {
-                val sb = StringBuilder()
-                sb.append("Номера ячеек и датчиков — внутри модуля\n")
-                sb.append("Мод  мин.ячейка    макс.ячейка    ΔV     температура\n")
-                for (m in 0 until MODULE_COUNT) {
-                    val base = MODULE_BASE + m * 8
-                    val v = (0 until 8).map { rd(base + it) }
-                    val nMin = v[0]?.getOrNull(0)
-                    val vMin = v[1]?.let { le16(it, 0) }
-                    val nMax = v[2]?.getOrNull(0)
-                    val vMax = v[3]?.let { le16(it, 0) }
-                    val tMin = v[5]?.getOrNull(0)?.let { it - 40 }
-                    val tMax = v[7]?.getOrNull(0)?.let { it - 40 }
-                    fun cell(n: Int?, mv: Int?) =
-                        if (n == null || mv == null) "   ?         " else "#%-2d %.3f В".format(n + 1, mv / 1000.0)
-                    val dv = if (vMin != null && vMax != null) "%3d мВ".format(vMax - vMin) else "  ?   "
-                    val t = if (tMin != null && tMax != null) {
-                        if (tMin == tMax) "$tMin °C" else "$tMin…$tMax °C"
-                    } else "?"
-                    sb.append("%-4d %s  %s  %s  %s\n".format(m + 1, cell(nMin, vMin), cell(nMax, vMax), dv, t))
-                }
+            val modText = sb.toString()
+            ui.post { moduleView.text = modText }
 
-                val cells = (0 until CELL_PARAM_COUNT).map { i -> rd(CELL_PARAM_BASE + i)?.let { le16(it, 0) } }
-                val known = cells.withIndex().filter { it.value != null }.map { it.index to it.value!! }
-                sb.append("\nПараметр ячеек 0040–0099 (смысл пока неизвестен):\n")
-                if (known.isNotEmpty()) {
-                    val mn = known.minBy { it.second }
-                    val mx = known.maxBy { it.second }
-                    val avg = known.sumOf { it.second } / known.size.toDouble()
-                    sb.append("мин %d (ячейка %d), макс %d (ячейка %d), среднее %.1f\n".format(
-                        mn.second, mn.first + 1, mx.second, mx.first + 1, avg))
-                    for (row in cells.indices.chunked(10)) {
-                        sb.append("%2d-%2d: ".format(row.first() + 1, row.last() + 1))
-                        sb.append(row.joinToString(" ") { idx -> cells[idx]?.let { "%3d".format(it) } ?: "  ?" })
-                        sb.append("\n")
-                    }
-                } else {
-                    sb.append("нет ответа\n")
+            val cells = (0 until CELL_PARAM_COUNT).map { i -> if (cancel) null else readDid(e, CELL_PARAM_BASE + i)?.let { le16(it, 0) } }
+            val known = cells.withIndex().filter { it.value != null }.map { it.index to it.value!! }
+            val cb = StringBuilder()
+            if (known.isNotEmpty()) {
+                val mn = known.minBy { it.second }
+                val mx = known.maxBy { it.second }
+                val avg = known.sumOf { it.second } / known.size.toDouble()
+                cb.append("мин %d (ячейка %d), макс %d (ячейка %d), среднее %.1f\n\n".format(
+                    mn.second, mn.first + 1, mx.second, mx.first + 1, avg))
+                for (row in cells.indices.chunked(10)) {
+                    cb.append("%2d–%2d: ".format(row.first() + 1, row.last() + 1))
+                    cb.append(row.joinToString(" ") { idx -> cells[idx]?.let { "%3d".format(it) } ?: "  ?" })
+                    cb.append("\n")
                 }
-                val text = sb.toString()
-                ui.post { moduleView.text = text }
-                log("Модули и ячейки прочитаны\n$text")
-            } catch (ex: Exception) {
-                ui.post { moduleView.text = "Ошибка: ${ex.message}" }
-                onConnectionLost(ex)
-            }
+            } else cb.append("нет ответа")
+            val cellText = cb.toString()
+            ui.post { cellView.text = cellText }
+            log("Модули и ячейки прочитаны\n$modText\n$cellText")
+            val snap = PARAMS.joinToString(", ") { p -> "${p.key}=${values[p.key]?.let { "%.2f".format(it) } ?: "?"}" }
+            saveText("byd_modules", "# Модули и ячейки, ${Date()}\n# $snap\n\n$modText\nПараметр ячеек 0040–0099:\n$cellText")
+                ?.let { log("Сохранено: ${it.name}") }
         }
     }
 
-    // ---------------------------------------------------------------- Сканер
+    // =================================================================== Ошибки
 
-    private fun onScanClick() {
-        if (scanning) {
-            scanStop = true
-            scanBtn.text = "Останавливаю…"
-            return
+    private fun selectedTarget(sp: Spinner): Ecu = targets().getOrElse(sp.selectedItemPosition) { bms() }
+
+    private fun readDtcFor(e: Elm327, ecu: Ecu): Pair<List<Dtc>?, String?> {
+        select(e, ecu)
+        for (mask in listOf("FF", "0D", "08")) {
+            val raw = e.send("1902$mask", 5000)
+            if (verbose) log("1902$mask → ${raw.replace("\n", " | ")}")
+            when (val r = Uds.parseService(raw, 0x19)) {
+                is UdsResult.Ok -> return Dtcs.parse(r.data) to null
+                is UdsResult.Error -> if (r.nrc == 0x31 || r.nrc == 0x12) continue else return null to r.message
+            }
         }
-        if (elm == null) { toast("Сначала подключитесь к адаптеру"); return }
-        val options = arrayOf(
-            "Быстрый: 0000–00FF, 1F00–1FFF, F180–F1FF (~640 запросов, 2–5 мин)",
-            "Полный: 0000–0FFF, 1F00–1FFF, F180–F1FF (~4 500 запросов, 10–25 мин)"
-        )
+        return null to "блок не поддерживает чтение ошибок"
+    }
+
+    private fun dtcCard(ecu: Ecu, list: List<Dtc>?, err: String?): View {
+        val c = kit.card(ecu.label)
+        when {
+            err != null -> c.addView(kit.text(err, 13f, Palette.WARN))
+            list.isNullOrEmpty() -> c.addView(kit.text("Ошибок нет", 14f, Palette.ACCENT, true))
+            else -> for (d in list) {
+                c.addView(kit.text(d.code, 16f, if (d.active || d.confirmed) Palette.BAD else Palette.WARN, true))
+                c.addView(kit.text(d.statusText, 12f, Palette.SUB).apply { setPadding(0, 0, 0, kit.dp(6)) })
+            }
+        }
+        return c
+    }
+
+    private fun dtcReport(ecu: Ecu, list: List<Dtc>?, err: String?) = buildString {
+        append("${ecu.label}: ")
+        when {
+            err != null -> append(err)
+            list.isNullOrEmpty() -> append("ошибок нет")
+            else -> { append("\n"); list.forEach { append("  ${it.code}  ${it.statusText}\n") } }
+        }
+    }
+
+    private fun readDtcSelected() {
+        val ecu = selectedTarget(dtcSpinner)
+        dtcList.removeAllViews()
+        runTask("Чтение ошибок ${ecu.short}") { e ->
+            val (list, err) = readDtcFor(e, ecu)
+            log(dtcReport(ecu, list, err))
+            ui.post { dtcList.addView(dtcCard(ecu, list, err)) }
+        }
+    }
+
+    private fun readDtcAll() {
+        val all = targets()
+        dtcList.removeAllViews()
+        runTask("Проверка всех блоков") { e ->
+            val report = StringBuilder("# Коды ошибок, ${Date()}\n")
+            for ((n, ecu) in all.withIndex()) {
+                if (cancel) break
+                setTask("Ошибки: блок ${n + 1} из ${all.size} (${ecu.short})")
+                val (list, err) = readDtcFor(e, ecu)
+                report.append(dtcReport(ecu, list, err)).append("\n")
+                ui.post { dtcList.addView(dtcCard(ecu, list, err)) }
+            }
+            log(report.toString())
+            saveText("byd_dtc", report.toString())?.let { offerShare("Проверка завершена", it) }
+        }
+    }
+
+    private fun confirmClearDtc() {
+        val ecu = selectedTarget(dtcSpinner)
         AlertDialog.Builder(this)
-            .setTitle("Сканер BMS (адрес $header)")
-            .setItems(options) { _, which -> startScan(which == 1) }
+            .setTitle("Сбросить ошибки?")
+            .setMessage("Будут удалены все коды неисправностей блока ${ecu.label}.\n\n" +
+                "Сначала прочитайте и сохраните их. Сброс выполняйте на стоящей машине с включённым зажиганием.")
+            .setPositiveButton("Сбросить") { _, _ -> clearDtc(ecu) }
             .setNegativeButton("Отмена", null)
             .show()
     }
 
-    private fun startScan(full: Boolean) {
-        val ranges = if (full) listOf(0x0000..0x0FFF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
-                     else listOf(0x0000..0x00FF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
+    private fun clearDtc(ecu: Ecu) {
+        dtcList.removeAllViews()
+        runTask("Сброс ошибок ${ecu.short}") { e ->
+            select(e, ecu)
+            val raw = e.send("14FFFFFF", 8000)
+            val result = when (val r = Uds.parseService(raw, 0x14)) {
+                is UdsResult.Ok -> "Ошибки блока ${ecu.label} сброшены"
+                is UdsResult.Error -> "Не удалось сбросить: ${r.message}"
+            }
+            log(result)
+            toast(result)
+            Thread.sleep(500)
+            val (list, err) = readDtcFor(e, ecu)
+            ui.post { dtcList.addView(dtcCard(ecu, list, err)) }
+        }
+    }
+
+    // =================================================================== Поиск блоков
+
+    private fun confirmDiscover() {
+        AlertDialog.Builder(this)
+            .setTitle("Найти блоки?")
+            .setMessage("Приложение отправит на адреса 700–7FF безопасные запросы «на связи?» и прочитает " +
+                "идентификаторы ответивших блоков. Ничего не изменяется. Займёт 2–3 минуты, машина в режиме READY.")
+            .setPositiveButton("Начать") { _, _ -> discover() }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun discover() {
+        runTask("Поиск блоков") { e ->
+            restoreBase(e)
+            e.send("ATH1")
+            e.send("ATST32")
+            val r = e.send("ATCRA7XX")
+            if (r.contains("?")) { e.send("ATCF700"); e.send("ATCM700") }
+
+            val found = LinkedHashMap<Int, Int>()
+            val respIds = HashSet<Int>()
+            for (id in 0x700..0x7FF) {
+                if (cancel) break
+                if (id == 0x7DF || id in respIds) continue
+                if (id % 8 == 0) setTask("Поиск блоков: %03X, найдено %d".format(id, found.size))
+                e.send("ATSH%03X".format(id))
+                for (probe in listOf("3E00", "1001")) {
+                    val frames = CanFrames.assemble(e.send(probe, 1500))
+                    val hits = frames.filter { (rid, d) -> rid != id && d.isNotEmpty() && (d[0] == 0x7E || d[0] == 0x50 || d[0] == 0x7F) }
+                    if (hits.isNotEmpty()) {
+                        val rid = hits.keys.first()
+                        found[id] = rid
+                        respIds += hits.keys
+                        log("Блок: запрос %03X → ответ %03X".format(id, rid))
+                        break
+                    }
+                }
+            }
+            restoreBase(e)
+
+            val list = mutableListOf<Ecu>()
+            for ((n, entry) in found.entries.withIndex()) {
+                if (cancel) break
+                val (req, resp) = entry
+                setTask("Идентификация: %d из %d (%03X)".format(n + 1, found.size, req))
+                val tmp = Ecu(req, resp, "")
+                select(e, tmp)
+                val info = StringBuilder()
+                var sysName: String? = null
+                for ((did, title) in IDENT_DIDS) {
+                    val d = readDid(e, did.toInt(16)) ?: continue
+                    val v = asciiOrHex(d)
+                    if (did == "F197" && d.any { it in 0x41..0x7A }) sysName = v
+                    info.append("$title: $v\n")
+                }
+                val name = when {
+                    req == bms().req -> "BMS (батарея)"
+                    sysName != null -> sysName!!
+                    else -> "Блок %03X".format(req)
+                }
+                list += Ecu(req, resp, name, info.toString().trim())
+            }
+            restoreBase(e)
+
+            ui.post {
+                if (list.isNotEmpty() || !cancel) {
+                    ecus = list
+                    EcuStore.save(this, ecus)
+                    refreshTargets()
+                    renderEcus()
+                }
+            }
+            val report = buildString {
+                append("# Найденные блоки, ${Date()}\n")
+                for (ecu in list) append("\n${ecu.label}\n${ecu.info}\n")
+            }
+            log(report)
+            saveText("byd_ecus", report)?.let { offerShare("Найдено блоков: ${list.size}", it) }
+        }
+    }
+
+    private fun renderEcus() {
+        ecuList.removeAllViews()
+        if (ecus.isEmpty()) {
+            ecuList.addView(kit.card(null).apply { addView(kit.note("Блоки ещё не искались.")) })
+            return
+        }
+        for (ecu in ecus) {
+            val c = kit.card(ecu.label)
+            if (ecu.info.isNotEmpty()) c.addView(kit.text(ecu.info, 11f, Palette.SUB).apply { setPadding(0, 0, 0, kit.dp(8)) })
+            c.addView(kit.row(
+                kit.button("Ошибки") {
+                    val idx = targets().indexOfFirst { it.req == ecu.req }
+                    if (idx >= 0) dtcSpinner.setSelection(idx)
+                    selectTab(2)
+                    readDtcSelected()
+                },
+                kit.button("Скан параметров") { askScan(ecu) }
+            ))
+            ecuList.addView(c)
+        }
+    }
+
+    // =================================================================== OBD-II
+
+    private fun obdCheck() {
+        obdView.text = "Проверка…"
+        runTask("Проверка OBD-II") { e ->
+            restoreBase(e)
+            e.send("ATH1")
+            e.send("ATSH7DF")
+            e.send("ATFCSM0")
+            val supported = LinkedHashMap<Int, MutableSet<Int>>()
+            for (base in listOf(0x00, 0x20, 0x40, 0x60, 0x80, 0xA0)) {
+                if (cancel) break
+                val frames = CanFrames.assemble(e.send("01%02X".format(base), 3000))
+                var next = false
+                for ((id, d) in frames) {
+                    if (d.size < 6 || d[0] != 0x41 || d[1] != base) continue
+                    val set = supported.getOrPut(id) { sortedSetOf<Int>() }
+                    for (bit in 0 until 32) {
+                        if (((d[2 + bit / 8] shr (7 - bit % 8)) and 1) == 1) set += base + bit + 1
+                    }
+                    if (base + 0x20 in set) next = true
+                }
+                if (!next) break
+            }
+            val sb = StringBuilder()
+            if (supported.isEmpty()) {
+                sb.append("Машина не отвечает на стандартные запросы OBD-II.\n")
+            } else {
+                for ((id, set) in supported) {
+                    sb.append("Блок %03X поддерживает: %s\n".format(id, set.joinToString(" ") { "%02X".format(it) }))
+                }
+                sb.append("\n")
+                val all = supported.values.flatten().toSet()
+                for ((pid, def) in ObdPids.KNOWN) {
+                    if (cancel) break
+                    if (pid !in all) continue
+                    val frames = CanFrames.assemble(e.send("01%02X".format(pid), 3000))
+                    for ((id, d) in frames) {
+                        if (d.size < 2 || d[0] != 0x41 || d[1] != pid) continue
+                        val v = def.second(d.copyOfRange(2, d.size)) ?: continue
+                        sb.append("%s: %s  [%03X]\n".format(def.first, v, id))
+                    }
+                }
+                val vin = CanFrames.assemble(e.send("0902", 4000))
+                for ((id, d) in vin) {
+                    if (d.size > 3 && d[0] == 0x49 && d[1] == 0x02) sb.append("VIN: %s  [%03X]\n".format(asciiOrHex(d.copyOfRange(3, d.size)), id))
+                }
+            }
+            restoreBase(e)
+            val text = sb.toString()
+            ui.post { obdView.text = text }
+            log("OBD-II:\n$text")
+        }
+    }
+
+    // =================================================================== Сканер параметров
+
+    private fun askScan(ecu: Ecu) {
+        val options = arrayOf(
+            "Быстрый: 0000–00FF, 1F00–1FFF, F180–F1FF (~1 мин)",
+            "Полный: 0000–0FFF, 1F00–1FFF, F180–F1FF (~7 мин)",
+            "Диапазон производителя: F000–FFFF (~6 мин)"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Скан: ${ecu.label}")
+            .setItems(options) { _, which -> runScan(ecu, which) }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun runScan(ecu: Ecu, mode: Int) {
+        val ranges = when (mode) {
+            0 -> listOf(0x0000..0x00FF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
+            1 -> listOf(0x0000..0x0FFF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
+            else -> listOf(0xF000..0xFFFF)
+        }
+        val modeName = listOf("quick", "full", "vendor")[mode]
         val total = ranges.sumOf { it.count() }
-        stopPolling()
-        scanStop = false
-        scanning = true
-        scanBtn.text = "Остановить скан"
         val snapshot = PARAMS.joinToString(", ") { p -> "${p.key}=${values[p.key]?.let { "%.2f".format(it) } ?: "?"}" }
 
-        worker.execute {
-            val e = elm
-            if (e == null) { finishScan(null); return@execute }
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        runTask("Скан ${ecu.short}") { e ->
+            select(e, ecu)
             val out = StringBuilder()
-            out.append("# BYD Battery scan $stamp\n")
-            out.append("# header=$header mode=${if (full) "full" else "quick"} cells=$cellCount\n")
-            out.append("# snapshot: $snapshot\n")
+            out.append("# BYD scan ${Date()}\n")
+            out.append("# ecu=${ecu.label} mode=$modeName cells=$cellCount\n")
+            out.append("# snapshot BMS: $snapshot\n")
             out.append("# формат: DID  OK len=N : байты данных после 62 XX XX\n")
-            var done = 0
-            var hits = 0
-            var noReply = 0
+            var done = 0; var hits = 0; var noReply = 0
             val started = System.currentTimeMillis()
-            var lost: Exception? = null
+            var aborted: String? = null
             try {
                 outer@ for (range in ranges) {
                     for (did in range) {
-                        if (scanStop) break@outer
-                        val didHex = "%04X".format(did)
-                        val raw = e.send("22$didHex", 2500)
-                        when (val r = Uds.parse(raw, didHex)) {
+                        if (cancel) { aborted = "остановлен вручную"; break@outer }
+                        val h = "%04X".format(did)
+                        val raw = e.send("22$h", 2500)
+                        when (val r = Uds.parse(raw, h)) {
                             is UdsResult.Ok -> {
                                 hits++
-                                val bytes = r.data.joinToString(" ") { "%02X".format(it) }
-                                out.append("$didHex OK len=${r.data.size} : $bytes${Hints.of(r.data)}\n")
-                                log("✓ 22$didHex (${r.data.size} байт)")
+                                out.append("$h OK len=${r.data.size} : ${r.data.joinToString(" ") { "%02X".format(it) }}${Hints.of(r.data)}\n")
                             }
                             is UdsResult.Error -> when {
-                                r.nrc == 0x31 -> {} // не поддерживается — обычный случай
+                                r.nrc == 0x31 -> {}
                                 raw.contains("NO DATA") || raw.contains("TIMEOUT") -> noReply++
-                                else -> out.append("$didHex ERR ${r.message.replace("\n", " | ")}\n")
+                                else -> out.append("$h ERR ${r.message.replace("\n", " | ")}\n")
                             }
                         }
                         done++
+                        if (done == 30 && noReply == 30) { aborted = "блок не отвечает на запросы 22"; break@outer }
                         if (done % 16 == 0) {
                             val sec = (System.currentTimeMillis() - started) / 1000
-                            setStatus("Скан: $done/$total, найдено $hits, ${sec} с")
+                            setTask("Скан ${ecu.short}: $done/$total, найдено $hits, $sec с")
                         }
                     }
                 }
-            } catch (ex: Exception) {
-                lost = ex
+            } catch (ex: IOException) {
+                aborted = "связь потеряна: ${ex.message}"
+                out.append("# итого: проверено $done из $total, ответов $hits — $aborted\n")
+                saveText("byd_scan_${ecu.short}", out.toString())?.let { offerShare("Скан прерван", it) }
+                throw ex
             }
             val sec = (System.currentTimeMillis() - started) / 1000
             out.append("# итого: проверено $done из $total, ответов $hits, без ответа $noReply, время $sec с")
-            if (scanStop) out.append(", остановлен вручную")
-            if (lost != null) out.append(", связь потеряна: ${lost.message}")
+            aborted?.let { out.append(", $it") }
             out.append("\n")
-
-            var file: File? = null
-            try {
-                file = File(ScanFileProvider.dir(this), "byd_scan_$stamp.txt")
-                file.writeText(out.toString())
-                log("Скан сохранён: ${file.name} (найдено $hits)")
-            } catch (ex: Exception) {
-                log("Не удалось сохранить файл: ${ex.message}")
-                file = null
-            }
-            if (lost != null) onConnectionLost(lost)
-            finishScan(file)
+            log("Скан ${ecu.short} завершён: найдено $hits${aborted?.let { " ($it)" } ?: ""}")
+            saveText("byd_scan_${ecu.short}", out.toString())?.let { offerShare("Скан завершён", it) }
         }
     }
 
-    private fun finishScan(file: File?) {
-        scanning = false
-        ui.post {
-            scanBtn.text = "Запустить скан"
-            if (file != null) {
-                lastScanFile = file
-                AlertDialog.Builder(this)
-                    .setTitle("Скан завершён")
-                    .setMessage("Файл ${file.name} сохранён. Отправить его?")
-                    .setPositiveButton("Отправить") { _, _ -> shareFile(file) }
-                    .setNegativeButton("Позже", null)
-                    .show()
-            }
-            if (elm != null) {
-                setStatus("Подключено")
-                startPolling()
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------- Терминал
+    // =================================================================== Терминал
 
     private fun sendTerminal() {
         val cmd = termInput.text.toString().trim().uppercase().replace(" ", "")
         if (cmd.isEmpty()) return
-        val e = elm
-        if (e == null) { toast("Сначала подключитесь к адаптеру"); return }
-        if (scanning) { toast("Дождитесь окончания скана"); return }
+        val ecu = selectedTarget(termSpinner)
         termInput.setText("")
-        worker.execute {
-            try {
-                val r = e.send(cmd, 4000)
-                log("> $cmd\n$r")
-            } catch (ex: Exception) {
-                log("> $cmd : ошибка ${ex.message}")
-            }
+        runTask("Терминал") { e ->
+            select(e, ecu)
+            val r = e.send(cmd, 5000)
+            log("[${ecu.short}] > $cmd\n$r")
+            if (cmd.startsWith("AT")) selectedEcu = null // состояние адаптера могло измениться
         }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        recorder.flush()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        scanStop = true
+        recorder.stop()
+        cancel = true
         pollTask?.cancel(false)
         worker.execute { closeQuietly() }
         worker.shutdown()
