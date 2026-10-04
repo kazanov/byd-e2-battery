@@ -26,6 +26,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -77,6 +78,7 @@ class MainActivity : Activity() {
     private lateinit var termInput: EditText
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var moduleView: TextView
     private val valueViews = HashMap<String, TextView>()
     private val rawViews = HashMap<String, TextView>()
     private val logLines = ArrayDeque<String>()
@@ -156,16 +158,31 @@ class MainActivity : Activity() {
         btnRow.addView(pollBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(btnRow)
 
-        // --- Данные от BMS
-        section(root, "Данные BMS")
-        for (p in PARAMS) valueRow(root, p.key, "${p.title}  [22 ${p.did}]", true)
+        // --- Основное
+        section(root, "Батарея")
+        for (p in PARAMS.filter { it.group == G_MAIN }) valueRow(root, p.key, "${p.title}  [22 ${p.did}]", true)
 
-        // --- Вычисляемые
-        section(root, "Вычисляемые")
+        // --- Ячейки и температуры
+        section(root, "Ячейки и температуры")
+        valueRow(root, "cell_min", "Минимальная ячейка  [002A/002B]", false)
+        valueRow(root, "cell_max", "Максимальная ячейка  [002C/002D]", false)
+        valueRow(root, "cell_dv", "Разброс ячеек ΔV", false)
+        valueRow(root, "t_min", "Минимальная температура  [002E/002F]", false)
+        valueRow(root, "t_max", "Максимальная температура  [0030/0031]", false)
+        valueRow(root, "t_dt", "Разброс температур ΔT", false)
+
+        // --- Ёмкость и ресурс
+        section(root, "Ёмкость и ресурс")
+        for (p in PARAMS.filter { it.group == G_CAP }) valueRow(root, p.key, "${p.title}  [22 ${p.did}]", true)
+        valueRow(root, "soh", "SOH ≈ фактическая / номинальная ёмкость", false)
+        valueRow(root, "cycles", "Эквивалент полных циклов (получено / номинал)", false)
+        valueRow(root, "e_life", "Получено за всё время, примерно", false)
+
+        // --- Мощность и энергия
+        section(root, "Мощность и энергия")
         valueRow(root, "power", "Мощность (U × I)", false)
-        valueRow(root, "mode", "Режим (по знаку тока, проверьте на зарядке)", false)
+        valueRow(root, "mode", "Режим", false)
         valueRow(root, "crate", "C-rate (ток / ёмкость)", false)
-        valueRow(root, "soh", "SOH ≈ фактическая / номинальная ёмкость (гипотеза)", false)
         valueRow(root, "e_full", "Запас энергии при 100 % (ёмкость × ячеек × 3,2 В)", false)
         valueRow(root, "e_left", "Осталось энергии", false)
         valueRow(root, "e_in", "Получено батареей с момента сброса", false)
@@ -174,6 +191,17 @@ class MainActivity : Activity() {
             text = "Сбросить счётчики энергии"
             setOnClickListener { energyIn = 0.0; energyOut = 0.0; renderEnergy() }
         })
+
+        // --- Модули и ячейки
+        section(root, "Модули и ячейки")
+        root.addView(TextView(this).apply {
+            textSize = 13f
+            text = "Сводка по 7 модулям (016C–01A3) и неизвестный параметр каждой из 90 ячеек (0040–0099). " +
+                "Чтение занимает 10–20 секунд."
+        })
+        root.addView(Button(this).apply { text = "Прочитать модули и ячейки"; setOnClickListener { readModules() } })
+        moduleView = TextView(this).apply { typeface = Typeface.MONOSPACE; textSize = 11f; setTextIsSelectable(true) }
+        root.addView(HorizontalScrollView(this).apply { addView(moduleView) })
 
         // --- Сканер
         section(root, "Сканер BMS")
@@ -461,10 +489,26 @@ class MainActivity : Activity() {
 
         setValue("mode", when {
             i == null -> "—"
-            i > 0.5 -> "разряд (предположительно)"
-            i < -0.5 -> "заряд (предположительно)"
+            i > 0.5 -> "разряд"
+            i < -0.5 -> "заряд"
             else -> "покой"
         })
+
+        val cminN = values["cmin_n"]; val cminV = values["cmin_v"]
+        val cmaxN = values["cmax_n"]; val cmaxV = values["cmax_v"]
+        setValue("cell_min", if (cminV != null) "%.3f В  (№%d)".format(cminV, (cminN ?: 0.0).toInt()) else "—")
+        setValue("cell_max", if (cmaxV != null) "%.3f В  (№%d)".format(cmaxV, (cmaxN ?: 0.0).toInt()) else "—")
+        setValue("cell_dv", if (cminV != null && cmaxV != null) "%.0f мВ".format((cmaxV - cminV) * 1000) else "—")
+
+        val tminN = values["tmin_n"]; val tmin = values["tmin"]
+        val tmaxN = values["tmax_n"]; val tmax = values["tmax"]
+        setValue("t_min", if (tmin != null) "%.0f °C  (датчик %d)".format(tmin, (tminN ?: 0.0).toInt()) else "—")
+        setValue("t_max", if (tmax != null) "%.0f °C  (датчик %d)".format(tmax, (tmaxN ?: 0.0).toInt()) else "—")
+        setValue("t_dt", if (tmin != null && tmax != null) "%.0f °C".format(tmax - tmin) else "—")
+
+        val ahIn = values["ah_in"]
+        setValue("cycles", if (ahIn != null && capNom != null && capNom > 0) "%.0f".format(ahIn / capNom) else "—")
+        setValue("e_life", if (ahIn != null) "%.0f кВт·ч".format(ahIn * cellCount * CELL_NOMINAL_V / 1000.0) else "—")
 
         setValue("crate", if (i != null && cap != null && cap > 0) "%.3f C".format(i / cap) else "—")
 
@@ -490,6 +534,67 @@ class MainActivity : Activity() {
     private fun renderEnergy() {
         setValue("e_in", "%.3f кВт·ч".format(energyIn))
         setValue("e_out", "%.3f кВт·ч".format(energyOut))
+    }
+
+    // ---------------------------------------------------------------- Модули и ячейки
+
+    private fun readModules() {
+        val e = elm
+        if (e == null) { toast("Сначала подключитесь к адаптеру"); return }
+        if (scanning) { toast("Дождитесь окончания скана"); return }
+        moduleView.text = "Чтение…"
+        worker.execute {
+            fun rd(did: Int): IntArray? {
+                val h = "%04X".format(did)
+                return (Uds.parse(e.send("22$h"), h) as? UdsResult.Ok)?.data
+            }
+            try {
+                val sb = StringBuilder()
+                sb.append("Номера ячеек и датчиков — внутри модуля\n")
+                sb.append("Мод  мин.ячейка    макс.ячейка    ΔV     температура\n")
+                for (m in 0 until MODULE_COUNT) {
+                    val base = MODULE_BASE + m * 8
+                    val v = (0 until 8).map { rd(base + it) }
+                    val nMin = v[0]?.getOrNull(0)
+                    val vMin = v[1]?.let { le16(it, 0) }
+                    val nMax = v[2]?.getOrNull(0)
+                    val vMax = v[3]?.let { le16(it, 0) }
+                    val tMin = v[5]?.getOrNull(0)?.let { it - 40 }
+                    val tMax = v[7]?.getOrNull(0)?.let { it - 40 }
+                    fun cell(n: Int?, mv: Int?) =
+                        if (n == null || mv == null) "   ?         " else "#%-2d %.3f В".format(n + 1, mv / 1000.0)
+                    val dv = if (vMin != null && vMax != null) "%3d мВ".format(vMax - vMin) else "  ?   "
+                    val t = if (tMin != null && tMax != null) {
+                        if (tMin == tMax) "$tMin °C" else "$tMin…$tMax °C"
+                    } else "?"
+                    sb.append("%-4d %s  %s  %s  %s\n".format(m + 1, cell(nMin, vMin), cell(nMax, vMax), dv, t))
+                }
+
+                val cells = (0 until CELL_PARAM_COUNT).map { i -> rd(CELL_PARAM_BASE + i)?.let { le16(it, 0) } }
+                val known = cells.withIndex().filter { it.value != null }.map { it.index to it.value!! }
+                sb.append("\nПараметр ячеек 0040–0099 (смысл пока неизвестен):\n")
+                if (known.isNotEmpty()) {
+                    val mn = known.minBy { it.second }
+                    val mx = known.maxBy { it.second }
+                    val avg = known.sumOf { it.second } / known.size.toDouble()
+                    sb.append("мин %d (ячейка %d), макс %d (ячейка %d), среднее %.1f\n".format(
+                        mn.second, mn.first + 1, mx.second, mx.first + 1, avg))
+                    for (row in cells.indices.chunked(10)) {
+                        sb.append("%2d-%2d: ".format(row.first() + 1, row.last() + 1))
+                        sb.append(row.joinToString(" ") { idx -> cells[idx]?.let { "%3d".format(it) } ?: "  ?" })
+                        sb.append("\n")
+                    }
+                } else {
+                    sb.append("нет ответа\n")
+                }
+                val text = sb.toString()
+                ui.post { moduleView.text = text }
+                log("Модули и ячейки прочитаны\n$text")
+            } catch (ex: Exception) {
+                ui.post { moduleView.text = "Ошибка: ${ex.message}" }
+                onConnectionLost(ex)
+            }
+        }
     }
 
     // ---------------------------------------------------------------- Сканер
