@@ -6,27 +6,28 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Фиксированная версия образа: переход ubuntu-latest на Ubuntu 26 не повлияет на сборку
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.9'
 
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: BydBattery-apk
           path: app/build/outputs/apk/debug/*.apk
