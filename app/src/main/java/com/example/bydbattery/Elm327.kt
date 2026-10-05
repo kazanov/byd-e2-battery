@@ -70,6 +70,7 @@ object Uds {
         if (lines.isEmpty()) return null to "пустой ответ"
 
         val multiFrame = lines.any { it.contains(':') }
+        var declared = -1
         val hex = StringBuilder()
         for (line in lines) {
             var s = line.replace(" ", "")
@@ -77,12 +78,15 @@ object Uds {
             if (colon in 1..2) {
                 s = s.substring(colon + 1)
             } else if (multiFrame && s.length <= 3) {
+                // строка с длиной сообщения, например "012" — по ней отрезаем заполнение (AA/00/55)
+                if (declared < 0) declared = s.toIntOrNull(16) ?: -1
                 continue
             }
             if (!HEX.matches(s) || s.length % 2 != 0) return null to lines.joinToString(" ")
             hex.append(s)
         }
-        val bytes = hex.chunked(2).map { it.toInt(16) }
+        var bytes = hex.chunked(2).map { it.toInt(16) }
+        if (declared in 1 until bytes.size) bytes = bytes.take(declared)
         return if (bytes.isEmpty()) null to "нет данных" else bytes to ""
     }
 

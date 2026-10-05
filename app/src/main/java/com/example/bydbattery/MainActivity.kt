@@ -116,7 +116,7 @@ class MainActivity : Activity() {
     }
 
     /** Список блоков для выбора: BMS + найденные. */
-    private fun targets(): List<Ecu> = listOf(bms()) + ecus.filter { it.req != bms().req }
+    private fun targets(): List<Ecu> = listOf(bms()) + ecus.filter { it.req != bms().req }.map { EcuNames.apply(it) }
 
     // =================================================================== UI
 
@@ -326,6 +326,8 @@ class MainActivity : Activity() {
         c.addView(kit.note("Поиск перебирает адреса 700–7FF безопасным запросом «на связи?» и читает " +
             "идентификаторы ответивших блоков. Машина в режиме READY, около 2–3 минут."))
         c.addView(kit.button("Найти блоки", primary = true) { confirmDiscover() })
+        c.addView(kit.spacer(8))
+        c.addView(kit.button("Скан всех блоков") { askScanAll() })
         p.addView(c)
         ecuList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         p.addView(ecuList)
@@ -1136,11 +1138,7 @@ class MainActivity : Activity() {
                     if (did == "F197" && d.any { it in 0x41..0x7A }) sysName = v
                     info.append("$title: $v\n")
                 }
-                val name = when {
-                    req == bms().req -> "BMS (батарея)"
-                    sysName != null -> sysName!!
-                    else -> "Блок %03X".format(req)
-                }
+                val name = if (req == bms().req) "BMS (батарея)" else EcuNames.of(req, sysName ?: "")
                 list += Ecu(req, resp, name, info.toString().trim())
             }
             restoreBase(e)
@@ -1155,7 +1153,7 @@ class MainActivity : Activity() {
             }
             val report = buildString {
                 append("# Найденные блоки, ${Date()}\n")
-                for (ecu in list) append("\n${ecu.label}\n${ecu.info}\n")
+                for (ecu in list) append("\n${ecu.label}\n${decorateInfo(ecu.info)}\n")
             }
             log(report)
             saveText("byd_ecus", report)?.let { offerShare("Найдено блоков: ${list.size}", it) }
@@ -1168,9 +1166,10 @@ class MainActivity : Activity() {
             ecuList.addView(kit.card(null).apply { addView(kit.note("Блоки ещё не искались.")) })
             return
         }
-        for (ecu in ecus) {
+        for (raw in ecus) {
+            val ecu = EcuNames.apply(raw)
             val c = kit.card(ecu.label)
-            if (ecu.info.isNotEmpty()) c.addView(kit.text(ecu.info, 11f, Palette.SUB).apply { setPadding(0, 0, 0, kit.dp(8)) })
+            if (ecu.info.isNotEmpty()) c.addView(kit.text(decorateInfo(ecu.info), 11f, Palette.SUB).apply { setPadding(0, 0, 0, kit.dp(8)) })
             c.addView(kit.row(
                 kit.button("Ошибки") {
                     val idx = targets().indexOfFirst { it.req == ecu.req }
@@ -1217,15 +1216,22 @@ class MainActivity : Activity() {
                 }
                 sb.append("\n")
                 val all = supported.values.flatten().toSet()
-                for ((pid, def) in ObdPids.KNOWN) {
+                for (pid in all.sorted()) {
                     if (cancel) break
-                    if (pid !in all) continue
-                    val frames = CanFrames.assemble(e.send("01%02X".format(pid), 3000))
+                    if (pid % 0x20 == 0) continue // это маски поддерживаемых PID
+                    val raw = e.send("01%02X".format(pid), 3000)
+                    val frames = CanFrames.assemble(raw)
+                    val def = ObdPids.KNOWN[pid]
+                    var shown = false
                     for ((id, d) in frames) {
                         if (d.size < 2 || d[0] != 0x41 || d[1] != pid) continue
-                        val v = def.second(d.copyOfRange(2, d.size)) ?: continue
-                        sb.append("%s: %s  [%03X]\n".format(def.first, v, id))
+                        val data = d.copyOfRange(2, d.size)
+                        val v = def?.second?.invoke(data)
+                        val title = def?.first ?: "PID %02X".format(pid)
+                        sb.append("%s: %s  [%03X]\n".format(title, v ?: data.joinToString(" ") { "%02X".format(it) }, id))
+                        shown = true
                     }
+                    if (!shown) sb.append("PID %02X: не разобран, ответ: %s\n".format(pid, raw.replace("\n", " | ")))
                 }
                 val vin = CanFrames.assemble(e.send("0902", 4000))
                 for ((id, d) in vin) {
@@ -1254,63 +1260,120 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun runScan(ecu: Ecu, mode: Int) {
-        val ranges = when (mode) {
-            0 -> listOf(0x0000..0x00FF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
-            1 -> listOf(0x0000..0x0FFF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
-            else -> listOf(0xF000..0xFFFF)
-        }
-        val modeName = listOf("quick", "full", "vendor")[mode]
-        val total = ranges.sumOf { it.count() }
-        val snapshot = PARAMS.joinToString(", ") { p -> "${p.key}=${values[p.key]?.let { "%.2f".format(it) } ?: "?"}" }
+    private fun scanRanges(mode: Int) = when (mode) {
+        0 -> listOf(0x0000..0x00FF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
+        1 -> listOf(0x0000..0x0FFF, 0x1F00..0x1FFF, 0xF180..0xF1FF)
+        else -> listOf(0xF000..0xFFFF)
+    }
 
+    private fun snapshotBms() =
+        PARAMS.joinToString(", ") { p -> "${p.key}=${values[p.key]?.let { "%.2f".format(it) } ?: "?"}" }
+
+    private class ScanStats(var done: Int = 0, var hits: Int = 0, var noReply: Int = 0, var aborted: String? = null)
+
+    /** Сканирует один блок и дописывает результаты в out. IOException пробрасывается наверх. */
+    private fun scanInto(e: Elm327, ecu: Ecu, ranges: List<IntRange>, out: StringBuilder, progress: (ScanStats, Int) -> Unit): ScanStats {
+        select(e, ecu)
+        val total = ranges.sumOf { it.count() }
+        val st = ScanStats()
+        outer@ for (range in ranges) {
+            for (did in range) {
+                if (cancel) { st.aborted = "остановлен вручную"; break@outer }
+                val h = "%04X".format(did)
+                val raw = e.send("22$h", 2500)
+                when (val r = Uds.parse(raw, h)) {
+                    is UdsResult.Ok -> {
+                        st.hits++
+                        out.append("$h OK len=${r.data.size} : ${r.data.joinToString(" ") { "%02X".format(it) }}${Hints.of(r.data)}\n")
+                    }
+                    is UdsResult.Error -> when {
+                        r.nrc == 0x31 -> {}
+                        raw.contains("NO DATA") || raw.contains("TIMEOUT") -> st.noReply++
+                        else -> out.append("$h ERR ${r.message.replace("\n", " | ")}\n")
+                    }
+                }
+                st.done++
+                if (st.done == 30 && st.noReply == 30) { st.aborted = "блок не отвечает на запросы 22"; break@outer }
+                if (st.done % 16 == 0) progress(st, total)
+            }
+        }
+        out.append("# ${ecu.short}: проверено ${st.done} из $total, ответов ${st.hits}, без ответа ${st.noReply}")
+        st.aborted?.let { out.append(", $it") }
+        out.append("\n")
+        return st
+    }
+
+    private fun runScan(ecu: Ecu, mode: Int) {
+        val ranges = scanRanges(mode)
+        val modeName = listOf("quick", "full", "vendor")[mode]
+        val snapshot = snapshotBms()
         runTask("Скан ${ecu.short}") { e ->
-            select(e, ecu)
             val out = StringBuilder()
             out.append("# BYD scan ${Date()}\n")
             out.append("# ecu=${ecu.label} mode=$modeName cells=$cellCount\n")
             out.append("# snapshot BMS: $snapshot\n")
             out.append("# формат: DID  OK len=N : байты данных после 62 XX XX\n")
-            var done = 0; var hits = 0; var noReply = 0
             val started = System.currentTimeMillis()
-            var aborted: String? = null
             try {
-                outer@ for (range in ranges) {
-                    for (did in range) {
-                        if (cancel) { aborted = "остановлен вручную"; break@outer }
-                        val h = "%04X".format(did)
-                        val raw = e.send("22$h", 2500)
-                        when (val r = Uds.parse(raw, h)) {
-                            is UdsResult.Ok -> {
-                                hits++
-                                out.append("$h OK len=${r.data.size} : ${r.data.joinToString(" ") { "%02X".format(it) }}${Hints.of(r.data)}\n")
-                            }
-                            is UdsResult.Error -> when {
-                                r.nrc == 0x31 -> {}
-                                raw.contains("NO DATA") || raw.contains("TIMEOUT") -> noReply++
-                                else -> out.append("$h ERR ${r.message.replace("\n", " | ")}\n")
-                            }
-                        }
-                        done++
-                        if (done == 30 && noReply == 30) { aborted = "блок не отвечает на запросы 22"; break@outer }
-                        if (done % 16 == 0) {
-                            val sec = (System.currentTimeMillis() - started) / 1000
-                            setTask("Скан ${ecu.short}: $done/$total, найдено $hits, $sec с")
-                        }
-                    }
+                val st = scanInto(e, ecu, ranges, out) { st, total ->
+                    val sec = (System.currentTimeMillis() - started) / 1000
+                    setTask("Скан ${ecu.short}: ${st.done}/$total, найдено ${st.hits}, $sec с")
                 }
+                log("Скан ${ecu.short} завершён: найдено ${st.hits}${st.aborted?.let { " ($it)" } ?: ""}")
+                saveText("byd_scan_${ecu.short}", out.toString())?.let { offerShare("Скан завершён", it) }
             } catch (ex: IOException) {
-                aborted = "связь потеряна: ${ex.message}"
-                out.append("# итого: проверено $done из $total, ответов $hits — $aborted\n")
+                out.append("# связь потеряна: ${ex.message}\n")
                 saveText("byd_scan_${ecu.short}", out.toString())?.let { offerShare("Скан прерван", it) }
                 throw ex
             }
-            val sec = (System.currentTimeMillis() - started) / 1000
-            out.append("# итого: проверено $done из $total, ответов $hits, без ответа $noReply, время $sec с")
-            aborted?.let { out.append(", $it") }
-            out.append("\n")
-            log("Скан ${ecu.short} завершён: найдено $hits${aborted?.let { " ($it)" } ?: ""}")
-            saveText("byd_scan_${ecu.short}", out.toString())?.let { offerShare("Скан завершён", it) }
+        }
+    }
+
+    private fun askScanAll() {
+        if (ecus.isEmpty()) { toast("Сначала найдите блоки"); return }
+        val n = targets().size
+        val options = arrayOf(
+            "Быстрый: около ${n * 3 / 2} мин на $n блоков",
+            "Полный: около ${n * 7} мин на $n блоков"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Скан всех блоков")
+            .setItems(options) { _, which -> runScanAll(which) }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun runScanAll(mode: Int) {
+        val list = targets()
+        val ranges = scanRanges(mode)
+        val snapshot = snapshotBms()
+        runTask("Скан всех блоков") { e ->
+            val out = StringBuilder()
+            out.append("# BYD scan ALL ${Date()}\n")
+            out.append("# mode=${listOf("quick", "full")[mode]} blocks=${list.size}\n")
+            out.append("# snapshot BMS: $snapshot\n")
+            out.append("# формат: DID  OK len=N : байты данных после 62 XX XX\n")
+            val started = System.currentTimeMillis()
+            var totalHits = 0
+            try {
+                for ((n, ecu) in list.withIndex()) {
+                    if (cancel) break
+                    out.append("\n## ${ecu.label}\n")
+                    val st = scanInto(e, ecu, ranges, out) { st, total ->
+                        val min = (System.currentTimeMillis() - started) / 60000
+                        setTask("Блок ${n + 1} из ${list.size} (${ecu.short}): ${st.done}/$total, найдено ${st.hits} · $min мин")
+                    }
+                    totalHits += st.hits
+                    log("Скан ${ecu.short}: найдено ${st.hits}${st.aborted?.let { " ($it)" } ?: ""}")
+                }
+                val min = (System.currentTimeMillis() - started) / 60000
+                out.append("\n# итого: ответов $totalHits, время $min мин${if (cancel) ", остановлен вручную" else ""}\n")
+                saveText("byd_scan_all", out.toString())?.let { offerShare("Скан всех блоков завершён", it) }
+            } catch (ex: IOException) {
+                out.append("\n# связь потеряна: ${ex.message}\n")
+                saveText("byd_scan_all", out.toString())?.let { offerShare("Скан прерван", it) }
+                throw ex
+            }
         }
     }
 

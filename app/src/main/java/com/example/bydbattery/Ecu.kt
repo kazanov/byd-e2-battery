@@ -82,7 +82,9 @@ object Dtcs {
         val list = mutableListOf<Dtc>()
         var i = 2
         while (i + 3 < data.size) {
-            list += Dtc(code(data[i], data[i + 1], data[i + 2]), data[i + 3])
+            val rec = data.copyOfRange(i, i + 4)
+            val padding = rec.all { it == 0xAA } || rec.all { it == 0x55 } || (rec[0] == 0 && rec[1] == 0 && rec[2] == 0)
+            if (!padding) list += Dtc(code(data[i], data[i + 1], data[i + 2]), data[i + 3])
             i += 4
         }
         return list
@@ -108,4 +110,54 @@ object ObdPids {
         0xA6 to ("Одометр" to { d: IntArray ->
             if (d.size >= 4) "%.1f км".format(((d[0].toLong() shl 24) or (d[1].toLong() shl 16) or (d[2].toLong() shl 8) or d[3].toLong()) / 10.0) else null }),
     )
+}
+
+
+/** Названия блоков, опознанных по данным BYD e2. */
+object EcuNames {
+    private val KNOWN = mapOf(
+        0x7E7 to "BMS (батарея)",
+        0x782 to "IPB: тормоза, ABS/ESP",
+        0x783 to "Усилитель руля (вероятно)",
+        0x7E0 to "EL22: силовой блок (вероятно)",
+        0x7E2 to "EL22: силовой блок, 2-й адрес",
+        0x7E3 to "Силовой блок, ещё функция (вероятно)",
+        0x720 to "Кузовной блок (вероятно)",
+        0x7F1 to "SEC30-P50",
+    )
+
+    fun of(req: Int, reported: String): String {
+        val known = KNOWN[req]
+        return when {
+            known != null -> known
+            reported.isNotBlank() -> reported
+            else -> "Блок %03X".format(req)
+        }
+    }
+
+    fun apply(ecu: Ecu): Ecu {
+        val generic = ecu.name.isBlank() || ecu.name.startsWith("Блок ")
+        return if (KNOWN.containsKey(ecu.req) || generic) ecu.copy(name = of(ecu.req, if (generic) "" else ecu.name)) else ecu
+    }
+}
+
+/** Ищет в версии ПО/железа дату вида ГГ ММ ДД (BYD: 2-й или 3-й байт). */
+fun versionDate(d: IntArray): String? {
+    for (i in 0..3) {
+        if (i + 2 >= d.size) break
+        val y = d[i]; val m = d[i + 1]; val day = d[i + 2]
+        if (y in 0x12..0x20 && m in 1..12 && day in 1..31) return "%02d.%02d.20%02d".format(day, m, y)
+    }
+    return null
+}
+
+private val HEX_LIST = Regex("^([0-9A-F]{2}( |$))+$")
+
+/** Добавляет к строкам «Версия …: XX XX …» расшифрованную дату. */
+fun decorateInfo(info: String): String = info.lines().joinToString("\n") { line ->
+    val parts = line.split(": ", limit = 2)
+    if (parts.size == 2 && parts[0].startsWith("Версия") && HEX_LIST.matches(parts[1].trim())) {
+        val bytes = parts[1].trim().split(" ").map { it.toInt(16) }.toIntArray()
+        versionDate(bytes)?.let { "$line  (дата $it)" } ?: line
+    } else line
 }
