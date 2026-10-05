@@ -277,9 +277,20 @@ class MainActivity : Activity() {
             "cap_act" to "Фактическая ёмкость (вероятно)", "cap" to "Номинальная (вероятно)",
             "soh" to "SOH (фактич. / номинал)", "p0029" to "Параметр 0029 (SOH?)",
             "ah_out" to "Отдано всего (вероятно)", "ah_in" to "Получено всего (вероятно)",
-            "cycles" to "Эквивалент циклов", "e_life" to "Получено, кВт·ч ≈",
+            "kwh_out" to "Отдано всего, кВт·ч (вероятно)", "kwh_in" to "Получено всего, кВт·ч (вероятно)",
+            "cycles" to "Эквивалент циклов", "cons" to "Средний расход за всё время",
         ))
         p.addView(cap)
+
+        val lim = kit.card("Лимиты и изоляция (предположительно)")
+        lim.addView(kit.note("Расшифровка не подтверждена. 000A меняется под нагрузкой (около 80–86 в поездке) — " +
+            "похоже на лимит разряда в 0,1 кВт; 000B — возможно лимит заряда; 0015 меняется раз в ~30 с — похоже на " +
+            "сопротивление изоляции в кОм."))
+        addTiles(lim, listOf(
+            "lim_dis" to "000A: лимит разряда?", "lim_chg" to "000B: лимит заряда?",
+            "iso" to "0015: изоляция, кОм?",
+        ))
+        p.addView(lim)
 
         val energy = kit.card("Энергия")
         addTiles(energy, listOf(
@@ -358,16 +369,25 @@ class MainActivity : Activity() {
                 if (busy) return
                 select(e, Ecu(req, req + 8, ""))
                 for (p in params) {
+                    val raws = mutableListOf<String>()
                     val data = p.requests.map { rq ->
-                        val raw = e.send(rq, 1500)
-                        if (verbose) log("[%03X] $rq → ${raw.replace("\n", " | ")}".format(req))
+                        val raw = if (rq.startsWith("01")) {
+                            // OBD-II: блок отвечает только на общий адрес 7DF, приём по-прежнему фильтруется по его адресу
+                            e.send("ATSH7DF")
+                            val r = e.send(rq, 1500)
+                            e.send("ATSH%03X".format(req))
+                            r
+                        } else e.send(rq, 1500)
+                        if (verbose) log("[%03X] $rq → ".format(req) + raw.replace("\n", " | "))
                         val r = if (rq.startsWith("22")) Uds.parse(raw, rq.substring(2)) else Uds.parseService(raw, 0x01)
-                        (r as? UdsResult.Ok)?.data
+                        val d = (r as? UdsResult.Ok)?.data
+                        raws += d?.joinToString(" ") { "%02X".format(it) } ?: raw.replace("\n", " ")
+                        d
                     }
                     val v = try { p.decode(data) } catch (_: Exception) { null }
                     vvalues[p.key] = v?.num
                     setValue(p.key, v?.text ?: "—")
-                    setRaw(p.key, data.joinToString(" | ") { d -> d?.joinToString(" ") { "%02X".format(it) } ?: "нет" })
+                    setRaw(p.key, raws.joinToString(" | "))
                 }
             }
             if (motorId == null) {
@@ -975,7 +995,9 @@ class MainActivity : Activity() {
         setValue("soh", fmt(soh, "%.1f %%"))
         val ahIn = values["ah_in"]
         setValue("cycles", if (ahIn != null && capNom != null && capNom > 0) "%.0f".format(ahIn / capNom) else "—")
-        setValue("e_life", if (ahIn != null) "%.0f кВт·ч".format(ahIn * cellCount * CELL_NOMINAL_V / 1000.0) else "—")
+        val kwhOut = values["kwh_out"]
+        val odo = vvalues["odo"]
+        setValue("cons", if (kwhOut != null && odo != null && odo > 100) "%.1f кВт·ч/100 км".format(kwhOut / odo * 100) else "откройте «Машина»")
 
         val eFull = cap?.let { it * cellCount * CELL_NOMINAL_V / 1000.0 }
         setValue("e_full", fmt(eFull, "%.1f кВт·ч"))
