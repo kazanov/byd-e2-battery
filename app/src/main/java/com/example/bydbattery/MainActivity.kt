@@ -60,6 +60,10 @@ class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadScheduledExecutor()
     private var pollTask: ScheduledFuture<*>? = null
+    private var vehicleTask: ScheduledFuture<*>? = null
+    @Volatile private var vehicleOn = false
+    private val vvalues = HashMap<String, Double?>()
+    @Volatile private var motorId: String? = null
 
     // --- Состояние соединения (поток worker)
     @Volatile private var elm: Elm327? = null
@@ -108,6 +112,11 @@ class MainActivity : Activity() {
     private lateinit var recBtn: Button
     private lateinit var recBadge: TextView
     private lateinit var filesList: LinearLayout
+    private lateinit var motorView: TextView
+    private lateinit var watchSpinner: Spinner
+    private lateinit var watchBtn: Button
+    private lateinit var watchList: LinearLayout
+    @Volatile private var watching = false
     private val logLines = ArrayDeque<String>()
 
     private fun bms(): Ecu {
@@ -173,6 +182,7 @@ class MainActivity : Activity() {
         root.addView(content, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         val pages = listOf(
             "Батарея" to buildBatteryTab(),
+            "Машина" to buildVehicleTab(),
             "Модули" to buildModulesTab(),
             "Ошибки" to buildDtcTab(),
             "Блоки" to buildEcuTab(),
@@ -196,7 +206,9 @@ class MainActivity : Activity() {
             label.setTextColor(if (on) Palette.ACCENT else Palette.SUB)
             label.setTypeface(null, if (on) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
         }
-        if (index == 4) renderFiles()
+        if (index == 5) renderFiles()
+        vehicleOn = index == 1
+        if (index == 1) refreshWatchTargets()
     }
 
     private fun page(): Pair<ScrollView, LinearLayout> {
@@ -277,6 +289,161 @@ class MainActivity : Activity() {
         energy.addView(kit.button("Сбросить счётчики энергии") { energyIn = 0.0; energyOut = 0.0; renderEnergy() })
         p.addView(energy)
         return sv
+    }
+
+    // ---------- Вкладка «Машина»
+    private fun buildVehicleTab(): View {
+        val (sv, p) = page()
+
+        val intro = kit.card(null)
+        intro.addView(kit.note("Данные других блоков. Расшифрованы по одному снимку на стоящей машине, поэтому помечены " +
+            "«вероятно». Проверьте: пробег — с приборкой, 12 В — с показанием адаптера. Обновляются раз в 4 секунды, " +
+            "пока открыта эта вкладка или идёт запись."))
+        p.addView(intro)
+
+        val drive = kit.card("Движение")
+        addTiles(drive, listOf("odo" to "Пробег (7E0 001B)", "speed" to "Скорость (OBD)", "v12_adapter" to "12 В по адаптеру"))
+        p.addView(drive)
+
+        val inv = kit.card("Инвертор / мотор (7E3, вероятно)")
+        addTiles(inv, listOf("mcu_v" to "Напряжение HV", "mcu_t" to "Температуры 000E–0010", "mcu_ph" to "Температуры 1FF2"))
+        motorView = kit.text("", 11f, Palette.SUB)
+        inv.addView(motorView)
+        p.addView(inv)
+
+        val chg = kit.card("Зарядка / DC-DC (7E4, 793, вероятно)")
+        addTiles(chg, listOf(
+            "obc_v" to "Напряжение HV (7E4)", "obc_t" to "Температуры (7E4)",
+            "dcdc_v" to "Напряжение HV (793)", "v12a" to "12 В? (793 0004)",
+            "v12b" to "12 В? (793 0005)",
+        ))
+        p.addView(chg)
+
+        val w = kit.card("Наблюдение за неизвестными параметрами")
+        w.addView(kit.note("Опрашивает все ответившие при скане параметры выбранного блока и подсвечивает изменившиеся. " +
+            "Изменения пишутся в файл — включите во время поездки или зарядки и пришлите его. " +
+            "Опрос батареи на это время приостанавливается."))
+        watchSpinner = Spinner(this)
+        w.addView(watchSpinner)
+        w.addView(kit.spacer(8))
+        watchBtn = kit.button("Начать наблюдение", primary = true) { onWatchClick() }
+        w.addView(watchBtn)
+        watchList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, kit.dp(8), 0, 0) }
+        w.addView(HorizontalScrollView(this).apply { addView(watchList) })
+        p.addView(w)
+        return sv
+    }
+
+    private fun watchTargets(): List<Ecu> = targets().filter { WatchStore.get(this, it.req).isNotEmpty() }
+
+    private fun refreshWatchTargets() {
+        val names = watchTargets().map { "${it.label} — ${WatchStore.get(this, it.req).size} пар." }
+        val pos = watchSpinner.selectedItemPosition
+        watchSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+        if (pos in names.indices) watchSpinner.setSelection(pos)
+    }
+
+    // ---------- Опрос других блоков
+
+    private fun pollVehicle() {
+        val e = elm ?: return
+        if (busy || !(vehicleOn || recorder.active)) return
+        try {
+            val atrv = e.send("ATRV")
+            val v12 = Regex("([0-9]+[.,][0-9]+)").find(atrv)?.groupValues?.get(1)?.replace(',', '.')?.toDoubleOrNull()
+            vvalues["v12_adapter"] = v12
+            setValue("v12_adapter", if (v12 != null) "%.1f В".format(v12) else "—")
+
+            for ((req, params) in VPARAMS.groupBy { it.ecu }) {
+                if (busy) return
+                select(e, Ecu(req, req + 8, ""))
+                for (p in params) {
+                    val data = p.requests.map { rq ->
+                        val raw = e.send(rq, 1500)
+                        if (verbose) log("[%03X] $rq → ${raw.replace("\n", " | ")}".format(req))
+                        val r = if (rq.startsWith("22")) Uds.parse(raw, rq.substring(2)) else Uds.parseService(raw, 0x01)
+                        (r as? UdsResult.Ok)?.data
+                    }
+                    val v = try { p.decode(data) } catch (_: Exception) { null }
+                    vvalues[p.key] = v?.num
+                    setValue(p.key, v?.text ?: "—")
+                    setRaw(p.key, data.joinToString(" | ") { d -> d?.joinToString(" ") { "%02X".format(it) } ?: "нет" })
+                }
+            }
+            if (motorId == null) {
+                select(e, Ecu(0x7E3, 0x7EB, ""))
+                val d = readDid(e, 0xF1A0)
+                motorId = if (d != null) asciiOrHex(d) else ""
+                val text = motorId!!
+                if (text.isNotEmpty()) ui.post { motorView.text = "Идентификатор мотора (F1A0): $text" }
+            }
+        } catch (ex: Exception) {
+            onConnectionLost(ex)
+        }
+    }
+
+    // ---------- Наблюдение
+
+    private fun onWatchClick() {
+        if (watching) { cancel = true; return }
+        val list = watchTargets()
+        val ecu = list.getOrNull(watchSpinner.selectedItemPosition) ?: run { toast("Нет блоков для наблюдения"); return }
+        val dids = WatchStore.get(this, ecu.req)
+        watchList.removeAllViews()
+        val rows = dids.associateWith { did ->
+            kit.mono(11f).apply { text = "%04X  …".format(did); setPadding(0, kit.dp(2), 0, kit.dp(2)) }.also { watchList.addView(it) }
+        }
+        runTask("Наблюдение ${ecu.short}") { e ->
+            watching = true
+            ui.post { watchBtn.text = "Остановить наблюдение" }
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val file = File(ScanFileProvider.dir(this), "byd_watch_${ecu.short}_$stamp.csv")
+            val tf = SimpleDateFormat("HH:mm:ss", Locale.US)
+            val last = HashMap<Int, String>()
+            val changes = HashMap<Int, Int>()
+            var cycles = 0
+            try {
+                file.bufferedWriter(Charsets.UTF_8).use { w ->
+                    w.write("\uFEFFВремя;Блок;DID;Байты;LE16;Байт0\n")
+                    while (!cancel) {
+                        select(e, ecu)
+                        val now = System.currentTimeMillis()
+                        for (did in dids) {
+                            if (cancel) break
+                            val d = readDid(e, did)
+                            val hex = d?.joinToString(" ") { "%02X".format(it) } ?: "нет ответа"
+                            val prev = last[did]
+                            val changed = prev != null && prev != hex
+                            if (prev == null || changed) {
+                                if (changed) changes[did] = (changes[did] ?: 0) + 1
+                                w.write("%s;%03X;%04X;%s;%s;%s\n".format(tf.format(Date(now)), ecu.req, did, hex,
+                                    d?.let { le16(it, 0)?.toString() } ?: "", d?.getOrNull(0)?.toString() ?: ""))
+                            }
+                            last[did] = hex
+                            val dec = d?.let { a ->
+                                when {
+                                    a.size == 1 -> "= ${a[0]}"
+                                    a.size >= 2 -> "LE16 ${le16(a, 0)}"
+                                    else -> ""
+                                }
+                            } ?: ""
+                            val n = changes[did] ?: 0
+                            val line = "%04X  %-24s %-12s %s".format(did, hex.take(24), dec, if (n > 0) "изм. $n" else "")
+                            val color = if (changed) Palette.ACCENT else if (n > 0) Palette.WARN else Palette.TEXT
+                            ui.post { rows[did]?.apply { text = line; setTextColor(color) } }
+                        }
+                        w.flush()
+                        cycles++
+                        setTask("Наблюдение ${ecu.short}: цикл $cycles, меняются ${changes.size} из ${dids.size}")
+                    }
+                }
+            } finally {
+                watching = false
+                ui.post { watchBtn.text = "Начать наблюдение" }
+                log("Наблюдение ${ecu.short} остановлено: циклов $cycles, менялись ${changes.size} параметров")
+                if (cycles > 0) offerShare("Наблюдение остановлено", file)
+            }
+        }
     }
 
     // ---------- Вкладка «Модули»
@@ -717,11 +884,14 @@ class MainActivity : Activity() {
         if (pollTask != null) return
         lastPollMs = 0L
         pollTask = worker.scheduleWithFixedDelay({ pollOnce() }, 0, 1000, TimeUnit.MILLISECONDS)
+        vehicleTask = worker.scheduleWithFixedDelay({ pollVehicle() }, 2, 4, TimeUnit.SECONDS)
     }
 
     private fun stopPolling() {
         pollTask?.cancel(false)
         pollTask = null
+        vehicleTask?.cancel(false)
+        vehicleTask = null
     }
 
     private fun pollOnce() {
@@ -823,6 +993,7 @@ class MainActivity : Activity() {
 
         if (recorder.active) {
             val row = HashMap<String, Double?>(values)
+            row.putAll(vvalues)
             row["power_kw"] = power
             row["dv_mv"] = if (cminV != null && cmaxV != null) (cmaxV - cminV) * 1000 else null
             row["dt_c"] = if (tmin != null && tmax != null) tmax - tmin else null
@@ -1174,7 +1345,7 @@ class MainActivity : Activity() {
                 kit.button("Ошибки") {
                     val idx = targets().indexOfFirst { it.req == ecu.req }
                     if (idx >= 0) dtcSpinner.setSelection(idx)
-                    selectTab(2)
+                    selectTab(3)
                     readDtcSelected()
                 },
                 kit.button("Скан параметров") { askScan(ecu) }
@@ -1276,6 +1447,7 @@ class MainActivity : Activity() {
         select(e, ecu)
         val total = ranges.sumOf { it.count() }
         val st = ScanStats()
+        val found = mutableListOf<Pair<Int, Int>>()
         outer@ for (range in ranges) {
             for (did in range) {
                 if (cancel) { st.aborted = "остановлен вручную"; break@outer }
@@ -1284,6 +1456,7 @@ class MainActivity : Activity() {
                 when (val r = Uds.parse(raw, h)) {
                     is UdsResult.Ok -> {
                         st.hits++
+                        found += did to r.data.size
                         out.append("$h OK len=${r.data.size} : ${r.data.joinToString(" ") { "%02X".format(it) }}${Hints.of(r.data)}\n")
                     }
                     is UdsResult.Error -> when {
@@ -1297,6 +1470,7 @@ class MainActivity : Activity() {
                 if (st.done % 16 == 0) progress(st, total)
             }
         }
+        if (st.aborted == null) WatchStore.put(this, ecu.req, WatchStore.filter(found))
         out.append("# ${ecu.short}: проверено ${st.done} из $total, ответов ${st.hits}, без ответа ${st.noReply}")
         st.aborted?.let { out.append(", $it") }
         out.append("\n")

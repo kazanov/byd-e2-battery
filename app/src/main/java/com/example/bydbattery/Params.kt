@@ -64,6 +64,10 @@ const val CELL_PARAM_COUNT = 90
 /** Подсказки для сканера: на что похож блок данных. */
 object Hints {
     fun of(d: IntArray): String {
+        val trimmed = d.toList().dropLastWhile { it == 0x20 || it == 0x00 || it == 0xFF }
+        if (trimmed.size >= 3 && trimmed.all { it in 0x20..0x7E }) {
+            return "   <-- текст: \"" + trimmed.map { it.toChar() }.joinToString("") + "\""
+        }
         val hints = mutableListOf<String>()
         if (d.size >= 16) {
             for (offset in 0..1) {

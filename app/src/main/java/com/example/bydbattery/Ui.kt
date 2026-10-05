@@ -99,7 +99,7 @@ class UiKit(private val ctx: Context) {
 
     fun spacer(hDp: Int) = View(ctx).apply { layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, dp(hDp)) }
 
-    fun tabLabel(s: String) = text(s, 13f, Palette.SUB).apply {
+    fun tabLabel(s: String) = text(s, 12f, Palette.SUB).apply {
         gravity = Gravity.CENTER
         setPadding(0, dp(14), 0, dp(14))
     }
