@@ -35,10 +35,10 @@ jobs:
           umask 077
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/byd-debug.p12"
 
-      - name: Build debug APK
+      - name: Test and build debug APK
         env:
           ANDROID_DEBUG_KEYSTORE: ${{ runner.temp }}/byd-debug.p12
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace
 
       - uses: actions/upload-artifact@v7
         with:

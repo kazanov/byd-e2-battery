@@ -37,7 +37,11 @@ class ScanFileProvider : ContentProvider() {
     }
 
     override fun getType(uri: Uri): String =
-        if (uri.lastPathSegment?.endsWith(".csv") == true) "text/csv" else "text/plain"
+        when (uri.lastPathSegment?.substringAfterLast('.')) {
+            "csv" -> "text/csv"
+            "json" -> "application/json"
+            else -> "text/plain"
+        }
 
     override fun query(
         uri: Uri, projection: Array<out String>?, selection: String?,

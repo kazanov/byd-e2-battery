@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -88,6 +89,9 @@ class MainActivity : Activity() {
     private var lastPollMs = 0L
     private var ecus = mutableListOf<Ecu>()
     private lateinit var recorder: Recorder
+    private lateinit var historyStore: HistoryStore
+    private lateinit var historyPanel: HistoryPanel
+    private var historyErrorReported = false
 
     // --- Views
     private lateinit var connView: TextView
@@ -138,6 +142,15 @@ class MainActivity : Activity() {
         showRaw = prefs.getBoolean("raw", false)
         ecus = EcuStore.load(this)
         recorder = Recorder(ScanFileProvider.dir(this))
+        historyStore = HistoryStore(File(filesDir, "history"))
+        historyPanel = HistoryPanel(this, kit, historyStore,
+            execute = { action -> worker.execute { action() } },
+            connected = { elm != null && !busy }, targets = { targets() },
+            capture = { ecu, title -> captureSnapshot(ecu, title) },
+            export = { prefix, text -> worker.execute {
+                val extension = if (prefix == "byd_charge" || prefix == "byd_snapshot") "json" else "txt"
+                saveText(prefix, text, extension)?.let { file -> ui.post { if (!isDestroyed) shareFile(file) } }
+            } })
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Palette.BG
@@ -148,6 +161,7 @@ class MainActivity : Activity() {
         renderEcus()
         renderEnergy()
         setConn(false, "Не подключено")
+        historyPanel.refresh()
     }
 
     private fun savePrefs() {
@@ -187,15 +201,19 @@ class MainActivity : Activity() {
             "Ошибки" to buildDtcTab(),
             "Блоки" to buildEcuTab(),
             "Сервис" to buildServiceTab(),
+            "История" to historyPanel.build(),
         )
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Palette.TAB_BG) }
         pages.forEachIndexed { i, (name, page) ->
             content.addView(page, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             val label = kit.tabLabel(name).apply { setOnClickListener { selectTab(i) } }
-            bar.addView(label, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            bar.addView(label, LinearLayout.LayoutParams(kit.dp(86), WRAP_CONTENT))
             tabs += label to page
         }
-        root.addView(bar)
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = true
+            addView(bar)
+        })
         return root
     }
 
@@ -207,6 +225,7 @@ class MainActivity : Activity() {
             label.setTypeface(null, if (on) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
         }
         if (index == 5) renderFiles()
+        if (index == 6) historyPanel.refresh()
         vehicleOn = index == 1
         if (index == 1) refreshWatchTargets()
     }
@@ -253,6 +272,7 @@ class MainActivity : Activity() {
         rec.addView(recStatus)
         recBtn = kit.button("Начать запись", primary = true) { onRecordClick() }
         rec.addView(recBtn)
+        rec.addView(kit.button("История зарядок и снимки") { selectTab(6) })
         p.addView(rec)
 
         val now = kit.card("Сейчас")
@@ -684,7 +704,7 @@ class MainActivity : Activity() {
     private fun shareFile(file: File) {
         val uri = ScanFileProvider.uriFor(file)
         val intent = Intent(Intent.ACTION_SEND).apply {
-            type = if (file.name.endsWith(".csv")) "text/csv" else "text/plain"
+            type = when (file.extension) { "csv" -> "text/csv"; "json" -> "application/json"; else -> "text/plain" }
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, file.name)
             clipData = ClipData.newRawUri(file.name, uri)
@@ -693,9 +713,9 @@ class MainActivity : Activity() {
         startActivity(Intent.createChooser(intent, "Отправить ${file.name}"))
     }
 
-    private fun saveText(prefix: String, text: String): File? = try {
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        File(ScanFileProvider.dir(this), "${prefix}_$stamp.txt").apply { writeText(text) }
+    private fun saveText(prefix: String, text: String, extension: String = "txt"): File? = try {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        File(ScanFileProvider.dir(this), "${prefix}_$stamp.$extension").apply { writeText(text) }
     } catch (ex: Exception) {
         log("Не удалось сохранить файл: ${ex.message}")
         null
@@ -836,6 +856,7 @@ class MainActivity : Activity() {
     }
 
     private fun closeQuietly() {
+        historyStore.pause()
         elm?.close()
         elm = null
         selectedEcu = null
@@ -886,12 +907,14 @@ class MainActivity : Activity() {
         setTask(name)
         worker.execute {
             try {
+                historyStore.pause()
                 block(e)
             } catch (ex: IOException) {
                 onConnectionLost(ex)
             } catch (ex: Exception) {
                 log("Ошибка: ${ex.message}")
             } finally {
+                historyStore.pause()
                 busy = false
                 setTask(null)
             }
@@ -1013,6 +1036,20 @@ class MainActivity : Activity() {
         lastPollMs = now
         renderEnergy()
 
+        try {
+            val dv = if (cminV != null && cmaxV != null) (cmaxV - cminV) * 1000 else null
+            if (historyStore.add(ChargePoint(0, soc, power?.let { -it }, values["temp"], dv, false), SystemClock.elapsedRealtime())) {
+                historyPanel.sampleStatus()
+            }
+            historyErrorReported = false
+        } catch (ex: Exception) {
+            if (!historyErrorReported) {
+                log("Ошибка истории зарядки: ${ex.message}")
+                toast("Не удалось сохранить историю зарядки: ${ex.message}")
+                historyErrorReported = true
+            }
+        }
+
         if (recorder.active) {
             val row = HashMap<String, Double?>(values)
             row.putAll(vvalues)
@@ -1129,6 +1166,45 @@ class MainActivity : Activity() {
     }
 
     // =================================================================== Модули
+
+    private fun captureSnapshot(ecu: Ecu, title: String) {
+        val dids = (WatchStore.get(this, ecu.req) +
+            (if (ecu.req == bms().req) PARAMS.map { it.did.toInt(16) } else emptyList()) +
+            VPARAMS.filter { it.ecu == ecu.req }.flatMap { it.requests }
+                .filter { it.startsWith("22") }.map { it.substring(2).toInt(16) } +
+            listOf(0xF193, 0xF195)).filter { it in 0..0xFFFF }.distinct().sorted()
+        runTask("Снимок ${ecu.short}") { e ->
+            select(e, ecu)
+            val started = System.currentTimeMillis()
+            val readings = mutableListOf<SnapshotReading>()
+            var connectionError: IOException? = null
+            for ((index, did) in dids.withIndex()) {
+                if (cancel) break
+                val hex = "%04X".format(did)
+                setTask("Снимок ${ecu.short}: ${index + 1}/${dids.size}")
+                try {
+                    when (val result = Uds.parse(e.send("22$hex"), hex)) {
+                        is UdsResult.Ok -> {
+                            val decoded = if (ecu.req == bms().req) PARAMS.filter { it.did == hex && it.title.isNotBlank() }
+                                .mapNotNull { p -> p.decode(result.data)?.let { p.title + ": " + "%.${p.decimals}f".format(it) + " " + p.unit } }
+                                .joinToString("; ").ifEmpty { null } else null
+                            readings += SnapshotReading(hex, result.data.joinToString(" ") { "%02X".format(it) }, decoded, null)
+                        }
+                        is UdsResult.Error -> readings += SnapshotReading(hex, null, null, result.message)
+                    }
+                } catch (ex: IOException) {
+                    readings += SnapshotReading(hex, null, null, "Связь потеряна: ${ex.message}")
+                    connectionError = ex
+                    break
+                }
+            }
+            historyStore.saveSnapshot(ParameterSnapshot(UUID.randomUUID().toString(), title, ecu.req, ecu.resp,
+                started, System.currentTimeMillis(), cancel || connectionError != null || readings.size != dids.size, readings))
+            historyPanel.refresh()
+            toast("Снимок сохранён: ${readings.count { it.hex != null }}/${readings.size} ответов")
+            connectionError?.let { throw it }
+        }
+    }
 
     private fun readDid(e: Elm327, did: Int): IntArray? {
         val h = "%04X".format(did)
@@ -1591,6 +1667,9 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         recorder.flush()
+        worker.execute {
+            try { historyStore.checkpoint() } catch (ex: Exception) { log("Ошибка сохранения истории: ${ex.message}") }
+        }
     }
 
     override fun onDestroy() {
@@ -1598,7 +1677,11 @@ class MainActivity : Activity() {
         recorder.stop()
         cancel = true
         pollTask?.cancel(false)
-        worker.execute { closeQuietly() }
+        worker.execute {
+            try { historyStore.stop(System.currentTimeMillis(), "Приложение закрыто") }
+            catch (ex: Exception) { log("Ошибка сохранения истории: ${ex.message}") }
+            finally { closeQuietly() }
+        }
         worker.shutdown()
     }
 }

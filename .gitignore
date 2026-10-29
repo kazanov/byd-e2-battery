@@ -1,0 +1,7 @@
+.DS_Store
+.gradle/
+**/build/
+local.properties
+*.keystore
+*.p12
+*-key.base64

@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.bydbattery"
         minSdk = 23
         targetSdk = 34
-        versionCode = 8
-        versionName = "4.4"
+        versionCode = 9
+        versionName = "4.5"
     }
 
     signingConfigs {
@@ -36,4 +36,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
