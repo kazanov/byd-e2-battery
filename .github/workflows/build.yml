@@ -24,7 +24,20 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Restore persistent signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Set the ANDROID_DEBUG_KEYSTORE_BASE64 repository secret before building."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/byd-debug.p12"
+
       - name: Build debug APK
+        env:
+          ANDROID_DEBUG_KEYSTORE: ${{ runner.temp }}/byd-debug.p12
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - uses: actions/upload-artifact@v7

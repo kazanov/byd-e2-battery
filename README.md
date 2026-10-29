@@ -27,7 +27,33 @@ ELM327 v1.5 (Bluetooth Classic / SPP).
 3. Откройте завершённый запуск, внизу в разделе **Artifacts** скачайте **BydBattery-apk**.
 4. Распакуйте архив и установите `app-debug.apk` на телефон (разрешите установку из неизвестных источников).
 
-Новая версия устанавливается поверх старой.
+### Постоянная подпись APK
+
+Workflow требует secret `ANDROID_DEBUG_KEYSTORE_BASE64` в Settings → Secrets and variables → Actions.
+Его значение — Base64 постоянного PKCS12-хранилища с alias `AndroidDebugKey`,
+паролем хранилища и ключа `android`. Сохраните резервную копию этого хранилища:
+для обновлений должен использоваться один и тот же ключ. Не коммитьте ключ в репозиторий.
+
+Создать такое хранилище самостоятельно (нужен JDK):
+
+```sh
+keytool -genkeypair -keystore byd-debug.p12 -storetype PKCS12 \
+  -alias AndroidDebugKey -keyalg RSA -keysize 2048 -validity 10950 \
+  -storepass android -keypass android -dname "CN=BYD Battery Debug"
+openssl base64 -A -in byd-debug.p12 -out byd-debug-key.base64
+```
+
+Содержимое `byd-debug-key.base64` вставьте в secret. Для всех последующих сборок
+используйте этот же secret. Это подпись debug-сборок, не настройка публикации в Google Play.
+
+Обновление поверх установленной версии требует совпадения подписи и applicationId,
+а также отсутствия понижения versionCode. При выпуске версии повышайте versionCode
+в `app/build.gradle.kts`.
+
+Старый workflow не сохранял автоматически созданный debug-ключ. Если исходный ключ
+установленного APK утрачен, перед переходом на постоянный ключ экспортируйте CSV и
+отчёты, удалите старое приложение и установите новую сборку. Удаление стирает данные
+приложения. Последующие версии с постоянным ключом смогут устанавливаться поверх.
 
 ## Использование
 

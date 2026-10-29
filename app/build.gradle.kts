@@ -15,6 +15,18 @@ android {
         versionName = "4.4"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            System.getenv("ANDROID_DEBUG_KEYSTORE")?.let { path ->
+                storeFile = file(path)
+                storeType = "PKCS12"
+                storePassword = "android"
+                keyAlias = "AndroidDebugKey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         release { isMinifyEnabled = false }
     }
